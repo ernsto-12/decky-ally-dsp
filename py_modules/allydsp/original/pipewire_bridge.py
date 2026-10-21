@@ -44,6 +44,7 @@ def stop_child(process):
 
 def pcm_command(remote, name, channels, positions, *, capture=False, latency=256):
     props = {'node.name': name, 'node.autoconnect': False, 'node.dont-reconnect': True,
+             'state.restore-props': False, 'state.restore-target': False,
              'resample.disable': True, 'channelmix.disable': True,
              'adapter.auto-port-config': {'mode': 'dsp', 'position': 'preserve'}}
     if capture:
@@ -55,30 +56,66 @@ def pcm_command(remote, name, channels, positions, *, capture=False, latency=256
 
 
 def wait_for_explicit_routes(graph, allowed, capture_sink, capture_name, playback_name,
-                             playback_sink, expected_count, stop, shutdown, observations,
+                             playback_sink, expected_routes, stop, shutdown, observations,
                              timeout=5):
-    """Allow bounded graph publication delay, preserving exact route checks."""
+    """Wait for publication, then pin every channel and both endpoint identities."""
     began = time.monotonic()
     deadline = began + timeout
     expected_pairs = ((capture_sink, capture_name), (playback_name, playback_sink))
+    expected_count = len(expected_routes)
+    route_keys = [(item['output_node'], item['input_node'], item['channel']) for item in expected_routes]
+    if not expected_count or len(set(route_keys)) != expected_count:
+        raise ValueError('Explicit route plan must contain unique channel pairs')
+    if any(key[:2] not in expected_pairs for key in route_keys):
+        raise ValueError('Explicit route plan contains an unexpected node pair')
+    identity_keys = tuple(side + suffix for side in ('output', 'input') for suffix in
+                          ('_node', '_node_id', '_node_serial', '_port', '_port_serial', '_port_name', '_channel'))
+    if any(item.get(key) is None for item in expected_routes for key in identity_keys):
+        raise ValueError('Explicit route plan lacks endpoint identity')
+    own_ids = {item[side + '_node_id'] for item in expected_routes for side in ('output', 'input')
+               if item[side + '_node'] in (capture_name, playback_name)}
     while True:
         if stop.is_set() and shutdown['signal'] is not None:
             return None
         snapshot = graph.audit(allowed)
         own = [link for link in snapshot['links']
                if link['output_node'] in (capture_name, playback_name)
-               or link['input_node'] in (capture_name, playback_name)]
-        if any((link['output_node'], link['input_node']) not in expected_pairs for link in own):
-            raise RuntimeError('Unexpected link touched a bridge process node')
+               or link['input_node'] in (capture_name, playback_name)
+               or link.get('output_node_id') in own_ids or link.get('input_node_id') in own_ids]
         if len(own) > expected_count:
             raise RuntimeError('Explicit bridge route has duplicate links')
         if any(link['error'] or link.get('state') == 'error' for link in own):
             raise RuntimeError('Explicit bridge route has a failed link')
         pending = any(link.get('state') not in ('active', 'paused') for link in own)
+        matched = set()
+        for link in own:
+            # Registry objects may be published after the link itself. Missing
+            # endpoint metadata can wait; conflicting metadata must fail closed.
+            complete = all(link.get(key) is not None for key in identity_keys)
+            candidates = [index for index, expected in enumerate(expected_routes)
+                          if all(link.get(key) is None or str(link[key]) == str(expected[key])
+                                 for key in identity_keys)]
+            if not candidates:
+                raise RuntimeError('Explicit bridge route endpoint identity or channel mismatch')
+            for side in ('output', 'input'):
+                if ((link.get(side + '_port_node_id') is not None
+                     and str(link[side + '_port_node_id']) != str(link[side + '_node_id']))
+                    or (link.get(side + '_direction') is not None and link[side + '_direction'] != side)):
+                    raise RuntimeError('Explicit bridge route port ownership or direction mismatch')
+            if not complete or any(link.get(side + '_port_node_id') is None
+                                   or link.get(side + '_direction') is None for side in ('output', 'input')):
+                pending = True
+                continue
+            if len(candidates) != 1:
+                raise RuntimeError('Explicit bridge route endpoint matches multiple requested channels')
+            if candidates[0] in matched:
+                raise RuntimeError('Explicit bridge route has duplicate channel links')
+            matched.add(candidates[0])
         if len(observations) < 128:
             observations.append({'elapsed_seconds': time.monotonic() - began,
-                                 'owned_link_count': len(own), 'pending': pending})
-        if len(own) == expected_count and not pending:
+                                 'owned_link_count': len(own), 'verified_channel_count': len(matched),
+                                 'pending': pending})
+        if len(own) == expected_count and len(matched) == expected_count and not pending:
             return snapshot
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -103,7 +140,7 @@ def main():
     if capture_sink == playback_sink:
         raise ValueError('Input and output targets must differ')
     positions = config['input_positions']
-    if not positions or any(x not in ('FL', 'FR', 'FC', 'LFE', 'RL', 'RR', 'SL', 'SR', 'MONO') for x in positions):
+    if not positions or len(positions) != len(set(positions)) or any(x not in ('FL', 'FR', 'FC', 'LFE', 'RL', 'RR', 'SL', 'SR', 'MONO') for x in positions):
         raise ValueError('Unknown input channel map')
     audit_root = Path(config['audit_directory']).resolve()
     audit_root.mkdir(parents=True, exist_ok=True)
@@ -256,13 +293,19 @@ def main():
         reader.start()
         def setup_graph():
             try:
-                graph.connect(capture_sink, capture_name, positions)
+                # A capture monitor starts producing as soon as its first link
+                # activates. Prepare the consumer before linking that source so
+                # port negotiation cannot fill the bounded PCM queue/pipe.
                 graph.connect(playback_name, playback_sink, ['FL', 'FR'])
+                graph.connect(capture_sink, capture_name, positions)
                 audit['created_links'] = list(graph.links)
+                audit['route_reconnections'] = list(graph.reconnections)
+                if len(audit['created_links']) != len(positions) + 2:
+                    raise RuntimeError('Explicit channel route plan is incomplete')
                 audit['route_wait_observations'] = []
                 snapshot = wait_for_explicit_routes(
                     graph, allowed, capture_sink, capture_name, playback_name, playback_sink,
-                    len(positions) + 2, stop, shutdown, audit['route_wait_observations'])
+                    audit['created_links'], stop, shutdown, audit['route_wait_observations'])
                 if snapshot is None:
                     audit['route_setup_interrupted_by_signal'] = True
                     return
@@ -290,6 +333,18 @@ def main():
         began = last_progress = last_status = time.monotonic()
         with selectors.DefaultSelector() as selector:
             selector.register(fd, selectors.EVENT_WRITE)
+            def write_playback(data):
+                offset = 0
+                deadline = time.monotonic() + .5
+                while offset < len(data):
+                    left = deadline - time.monotonic()
+                    if left <= 0 or not selector.select(left):
+                        counters['playback_pipe_timeouts'] += 1
+                        raise TimeoutError('Playback PCM pipe stopped consuming data')
+                    try:
+                        offset += os.write(fd, data[offset:])
+                    except BlockingIOError:
+                        pass
             input_file = (audit_dir / 'captured-worker-input.f32').open('xb') if config.get('retain_pcm') else None
             output_file = (audit_dir / 'worker-output.f32').open('xb') if config.get('retain_pcm') else None
             try:
@@ -299,13 +354,23 @@ def main():
                         clean = True
                         break
                     try:
-                        payload = fifo.get(timeout=.1)
+                        payload = fifo.get(timeout=.1 if ready.is_set() else .005)
                     except queue.Empty:
                         if capture.poll() is not None or playback.poll() is not None:
                             raise RuntimeError('Owned pw-cat process exited unexpectedly')
                         if time.monotonic() - last_progress > config.get('capture_stall_seconds', 5):
                             counters['capture_stall_timeouts'] += 1
                             raise TimeoutError('Sink monitor stopped delivering PCM')
+                        if not ready.is_set():
+                            # raw pw-cat reads stdin on its own main loop.
+                            # Keep it supplied while ports negotiate, otherwise
+                            # that read can prevent the remaining links from
+                            # activating. This is bounded startup silence, not
+                            # processed DLL output or captured game audio.
+                            if audit.get('startup_silent_frames', 0) + worker.frames > 5 * 48000:
+                                raise TimeoutError('Startup PCM silence limit reached')
+                            write_playback(bytes(worker.frames * 2 * 4))
+                            audit['startup_silent_frames'] = audit.get('startup_silent_frames', 0) + worker.frames
                         continue
                     tick = time.perf_counter_ns()
                     try:
@@ -317,17 +382,7 @@ def main():
                     roundtrip_count += 1
                     roundtrip_total_ns += elapsed_ns
                     roundtrip_max_ns = max(roundtrip_max_ns, elapsed_ns)
-                    offset = 0
-                    deadline = time.monotonic() + .5
-                    while offset < len(result):
-                        left = deadline - time.monotonic()
-                        if left <= 0 or not selector.select(left):
-                            counters['playback_pipe_timeouts'] += 1
-                            raise TimeoutError('Playback PCM pipe stopped consuming data')
-                        try:
-                            offset += os.write(fd, result[offset:])
-                        except BlockingIOError:
-                            pass
+                    write_playback(result)
                     counters['processed_blocks'] += 1
                     input_digest.update(payload)
                     output_digest.update(result)

@@ -6,9 +6,13 @@ The fork adds a choice between the existing converted speaker chain and a persis
 
 The original engine selects the official **speaker Game** or **generic headphone Game** configuration when the internal analog route changes. Both accept 48 kHz, six-channel PCM mapped to static audio objects through the original frontend and processing DLL. The headphone configuration renders binaural stereo; the tested speaker configuration applies its separate stereo spatial path. It does not receive Windows Atmos object metadata or decode Atmos bitstreams from ordinary PipeWire PCM. This profile does not establish identical built-in speaker calibration or a complete replacement for Dolby Access.
 
+Ordinary stereo game PCM provides no separate height channels or Atmos object metadata for this host to reconstruct.
+
 On an RC73XA running SteamOS 3.8.28, 18 offline frontend conditions were byte-identical to Windows. A persistent original HRTF worker also reproduced the Windows six-channel reference exactly. Isolated PipeWire null-sink tests verified capture, processing and playback PCM. These are channel-bed and transport checks; game compatibility, long-session stability and perceived sound still require testing.
 
 Original assets are imported locally with `scripts/import-original-engine.py --help`. The public release includes host code, not Dolby DLLs, OEM blobs, Windows Python or a Proton distribution. Until the private assets are imported, the original option is unavailable and the converted engine remains usable. In original mode, the imported pack fixes the effective Game profile for the active speaker/headphone route; converted per-game presets, voicings and extras remain saved for the converted engine.
+
+**Output boost** is an original-engine-only manual control: **0–12 dB** in **0.5 dB** steps, default **0 dB**. It adjusts the plugin's playback stream, independently of the converted engine's pre-gain, and does not change the DLL's PCM processing. It provides no automatic loudness compensation. Higher boost can clip loud scenes.
 
 The remainder describes the upstream converted engine.
 
@@ -96,9 +100,11 @@ scripts/fetch-lsp.sh                # bundle the LV2 plugins
 scripts/dev-deploy.sh deck@<ip>     # copy to the handheld and restart Decky
 ```
 
-Releases: tag `vX.Y.Z` matching `package.json`. GitHub Actions builds, tests,
-packages `ally-dsp-X.Y.Z.zip`, signs `SHA256SUMS` with the `MINISIGN_SEED`
-secret and publishes the release.
+Releases use tags `vX.Y.Z` matching `package.json`. Current releases are signed
+locally and uploaded to GitHub. GitHub Actions builds, tests and packages
+`ally-dsp-X.Y.Z.zip`; the tag workflow can also sign `SHA256SUMS` and publish
+when `MINISIGN_SEED` is configured. Without that secret, CI retains build
+artifacts and skips signed release publication.
 
 ## License
 

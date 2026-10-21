@@ -10,6 +10,7 @@ export const setPerApp = callable<[appId: string, entry: PerAppEntry | null], { 
 export const onRunningAppChanged = callable<[appId: string | null], { appId: string | null }>("on_running_app_changed");
 export const setEnabled = callable<[enabled: boolean], DspState>("set_enabled");
 export const setEngine = callable<[kind: EngineKind], { ok: boolean; engine: EngineState }>("set_engine");
+export const setOriginalGain = callable<[gain_db: number], { ok: boolean; outputGainDb: number; applied: boolean }>("set_original_gain");
 export const setExtras = callable<[extras: Partial<Extras>], { ok: boolean; extras: Extras; reconverting: boolean }>("set_extras");
 export const checkForUpdate = callable<[force: boolean], UpdateInfo>("check_for_update");
 export const prepareUpdate = callable<[], UpdateArtifact>("prepare_update");

@@ -4,6 +4,7 @@ These tests never invoke pactl/systemd or change the host audio session. They
 also run with unittest so the offline Windows research runtime needs no pytest.
 """
 import asyncio
+import copy
 import hashlib
 import importlib.util
 import json
@@ -69,13 +70,15 @@ class AudioSession:
             return Result(0, "42\n", "")
         elif op == "unload-module":
             self.sinks = [s for s in self.sinks if str(s["owner_module"]) != args[2]]
+        elif op == "set-sink-input-volume":
+            next(s for s in self.streams if s["index"] == int(args[2]))["volume_raw"] = int(args[3])
         else:
             raise AssertionError("Unexpected pactl command: " + repr(args))
         return Result(0, "", "")
 
     def mutations(self):
         return [x for x in self.calls if x[1] in
-                ("set-default-sink", "move-sink-input", "load-module", "unload-module")]
+                ("set-default-sink", "move-sink-input", "load-module", "unload-module", "set-sink-input-volume")]
 
 
 class OriginalRoutingTests(unittest.TestCase):
@@ -90,6 +93,7 @@ class OriginalRoutingTests(unittest.TestCase):
             self.stack.enter_context(patch.object(original, key, str(self.directory / name)))
         self.audio = AudioSession()
         self.stack.enter_context(patch.object(original, "run", self.audio.run))
+        self.stack.enter_context(patch.object(original, "apply_output_gain", return_value={"applied": False}))
         self.stack.enter_context(patch.object(original.hardware, "pw_dump", lambda: []))
         self.stack.enter_context(patch.object(original.hardware, "find_speaker_sink",
                                              lambda _: next((s for s in self.audio.sinks if s["name"] == "speaker"), None)))
@@ -199,6 +203,19 @@ class OriginalRoutingTests(unittest.TestCase):
         self.assertEqual(self.audio.streams[1]["sink"], 10)
         self.assertEqual(self.audio.default, original.CAPTURE_SINK)
         self.assertEqual(read_json(original.ROUTING_FILE)["moved"][0]["index"], 100)
+
+    def test_output_gain_is_applied_before_any_game_stream_moves_into_capture(self):
+        original._prepare_route_locked()
+        def gain():
+            self.assertEqual(self.audio.default, "speaker")
+            self.assertEqual(self.audio.streams[0]["sink"], 10)
+            self.assertEqual(read_json(original.ROUTING_FILE)["moved"], [])
+            return {"applied": True}
+        with patch.object(original, "verify", return_value=True), \
+             patch.object(original, "apply_output_gain", side_effect=gain) as apply:
+            original._route_after_ready_locked()
+        apply.assert_called_once_with()
+        self.assertEqual(self.audio.streams[0]["sink"], 99)
 
     def test_startup_readiness_failure_restores_routes_and_stops_shared_service(self):
         calls = []
@@ -465,6 +482,125 @@ class SharedServiceTests(unittest.TestCase):
             self.assertFalse(dsp_runtime.pause_for_headphones())
 
 
+class OutputGainTests(unittest.TestCase):
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory(
+            prefix="output-gain-test-", dir=ROOT / "tests")))
+        for name in ("ROUTING_FILE", "META_FILE", "STATUS_FILE"):
+            self.stack.enter_context(patch.object(original, name, str(self.root / (name + ".json"))))
+        self.audio = AudioSession()
+        self.audio.streams.append({"index": 101, "sink": 10, "volume_raw": 65536,
+                                   "properties": {"node.name": original.NAMESPACE + ".playback"}})
+        self.stack.enter_context(patch.object(original, "run", self.audio.run))
+        self.real_verify = original.verify
+        self.verify = self.stack.enter_context(patch.object(original, "verify", return_value=True))
+        self.stack.enter_context(patch.object(original.settings, "load", return_value={"original": {"outputGainDb": 6}}))
+        write_json(original.ROUTING_FILE, {"physical_sink": "speaker"})
+        write_json(original.META_FILE, {"engine": "original", "profile": "game", "outputGainDb": 0})
+
+    def test_gain_accepts_finite_inclusive_zero_to_twelve_db(self):
+        for value in (0, 6, 12, "6"):
+            with self.subTest(value=value):
+                self.assertEqual(original.validate_output_gain(value), float(value))
+
+    def test_out_of_range_and_nonfinite_gain_rejected_before_audio_commands(self):
+        for value in (-0.01, 12.01, float("nan"), float("inf"), -float("inf"), "nan", "inf"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "between 0 and 12"):
+                    original.apply_output_gain(value)
+        self.assertEqual(self.audio.calls, [])
+
+    def test_saved_gain_is_loaded_and_unspecified_setting_defaults_to_unity(self):
+        self.assertEqual(original.output_gain_db(), 6)
+        with patch.object(original.settings, "load", return_value={}):
+            self.assertEqual(original.output_gain_db(), 0)
+
+    def test_inactive_worker_keeps_all_audio_and_meta_unchanged(self):
+        self.verify.return_value = False
+        previous = Path(original.META_FILE).read_bytes()
+        self.assertEqual(original.apply_output_gain(12), {"outputGainDb": 12, "applied": False})
+        self.assertEqual(self.audio.calls, [])
+        self.assertEqual(Path(original.META_FILE).read_bytes(), previous)
+
+    def test_stale_ready_daemon_does_not_allow_any_pulse_volume_command(self):
+        write_json(original.STATUS_FILE, {"ready": True, "state": "running", "daemon_pid": 111})
+        # Use the real PID verification instead of treating a stale READY as active.
+        with patch.object(original, "verify", self.real_verify), \
+             patch.object(original.converted_runtime, "is_active", return_value=True), \
+             patch.object(original.converted_runtime, "systemctl", return_value=Result(0, "999\n", "")):
+            self.assertFalse(original.apply_output_gain(6)["applied"])
+        self.assertEqual(self.audio.calls, [])
+
+    def test_unrelated_game_stream_is_not_treated_as_owned_playback(self):
+        self.audio.streams[1]["properties"]["node.name"] = "game.playback"
+        with self.assertRaisesRegex(RuntimeError, "owned original playback"):
+            original.apply_output_gain(6)
+        self.assertEqual(self.audio.mutations(), [])
+
+    def test_duplicate_playback_names_fail_without_choosing_one_stream(self):
+        duplicate = copy.deepcopy(self.audio.streams[1])
+        duplicate["index"] = 102
+        self.audio.streams.append(duplicate)
+        with self.assertRaisesRegex(RuntimeError, "owned original playback"):
+            original.apply_output_gain(6)
+        self.assertEqual(self.audio.mutations(), [])
+
+    def test_playback_on_a_different_physical_sink_is_not_changed(self):
+        self.audio.streams[1]["sink"] = 20
+        with self.assertRaisesRegex(RuntimeError, "owned original playback"):
+            original.apply_output_gain(6)
+        self.assertEqual(self.audio.mutations(), [])
+
+    def test_missing_journal_physical_sink_is_not_substituted_with_another_output(self):
+        write_json(original.ROUTING_FILE, {"physical_sink": "missing"})
+        with self.assertRaisesRegex(RuntimeError, "owned original playback"):
+            original.apply_output_gain(6)
+        self.assertEqual(self.audio.mutations(), [])
+
+    def test_six_db_is_absolute_and_repeated_calls_do_not_accumulate_or_touch_other_volumes(self):
+        game = copy.deepcopy(self.audio.streams[0])
+        sinks = copy.deepcopy(self.audio.sinks)
+        self.audio.streams[1]["volume_raw"] = 90000
+        for _ in range(2):
+            self.assertEqual(original.apply_output_gain(), {"outputGainDb": 6, "applied": True})
+        self.assertEqual(self.audio.mutations(), [("pactl", "set-sink-input-volume", "101", "82505")] * 2)
+        self.assertEqual(self.audio.streams[1]["volume_raw"], 82505)
+        self.assertEqual(self.audio.streams[0], game)
+        self.assertEqual(self.audio.sinks, sinks)
+        self.assertEqual(self.audio.default, "speaker")
+        self.assertEqual(read_json(original.META_FILE)["outputGainDb"], 6)
+
+    def test_zero_restores_unity_and_twelve_sets_the_bounded_maximum(self):
+        for value, raw in [(12, 103868), (0, 65536)]:
+            with self.subTest(value=value):
+                self.assertTrue(original.apply_output_gain(value)["applied"])
+                self.assertEqual(self.audio.streams[1]["volume_raw"], raw)
+                self.assertEqual(read_json(original.META_FILE)["outputGainDb"], value)
+
+    def test_failed_pulse_volume_write_does_not_claim_changed_active_meta(self):
+        previous = Path(original.META_FILE).read_bytes()
+        def run(args, **kwargs):
+            if args[1] == "set-sink-input-volume":
+                return Result(1, "", "volume rejected")
+            return self.audio.run(args, **kwargs)
+        with patch.object(original, "run", side_effect=run):
+            with self.assertRaisesRegex(RuntimeError, "volume rejected"):
+                original.apply_output_gain(6)
+        self.assertEqual(Path(original.META_FILE).read_bytes(), previous)
+        self.assertEqual(self.audio.streams[1]["volume_raw"], 65536)
+
+    def test_successful_volume_write_is_not_rolled_back_for_auxiliary_metadata_failure(self):
+        previous = Path(original.META_FILE).read_bytes()
+        with patch.object(original, "write_json", side_effect=OSError("metadata storage unavailable")), \
+             patch.object(original.logger, "warning") as warning:
+            self.assertEqual(original.apply_output_gain(6), {"outputGainDb": 6, "applied": True})
+        warning.assert_called_once()
+        self.assertEqual(self.audio.streams[1]["volume_raw"], 82505)
+        self.assertEqual(Path(original.META_FILE).read_bytes(), previous)
+
+
 class RecoveryHelperTests(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
@@ -627,6 +763,12 @@ class BackendSwitchTests(unittest.TestCase):
             return await self.plugin.set_engine("original")
         return asyncio.run(scenario())
 
+    def set_gain(self, value):
+        async def scenario():
+            self.plugin.engine_lock = asyncio.Lock()
+            return await self.plugin.set_original_gain(value)
+        return asyncio.run(scenario())
+
     def test_missing_original_assets_do_not_stop_the_working_engine(self):
         with patch.object(self.main.original_runtime, "availability",
                           return_value={"available": False, "error": "missing local assets"}):
@@ -689,7 +831,76 @@ class BackendSwitchTests(unittest.TestCase):
                 asyncio.run(self.plugin._on_jack_change({"headphones": False}))
         self.assertEqual(self.events, [])
 
+    def test_gain_api_rejects_converted_engine_without_save_or_volume_change(self):
+        previous = copy.deepcopy(self.plugin.settings)
+        with patch.object(self.main.original_runtime, "apply_output_gain") as apply:
+            with self.assertRaisesRegex(RuntimeError, "Select the original engine"):
+                self.set_gain(6)
+        apply.assert_not_called()
+        self.assertEqual(self.plugin.settings, previous)
+        self.assertEqual(self.events, [])
+
+    def test_gain_api_rejects_nonfinite_request_without_save_or_volume_change(self):
+        self.plugin.settings["engine"]["kind"] = "original"
+        previous = copy.deepcopy(self.plugin.settings)
+        with patch.object(self.main.original_runtime, "apply_output_gain") as apply:
+            with self.assertRaisesRegex(ValueError, "between 0 and 12"):
+                self.set_gain(float("nan"))
+        apply.assert_not_called()
+        self.assertEqual(self.plugin.settings, previous)
+        self.assertEqual(self.events, [])
+
+    def test_gain_api_saves_then_applies_under_shared_lock_and_preserves_other_settings(self):
+        self.plugin.settings["engine"]["kind"] = "original"
+        self.plugin.settings["original"] = {"outputGainDb": 3, "other": "preserve"}
+        saved = []
+        self.plugin._save = lambda: saved.append(copy.deepcopy(self.plugin.settings))
+        def apply(value):
+            self.assertTrue(self.plugin.engine_lock.locked())
+            self.assertEqual(saved[-1]["original"]["outputGainDb"], value)
+            return {"outputGainDb": value, "applied": True}
+        with patch.object(self.main.original_runtime, "apply_output_gain", side_effect=apply) as command:
+            result = self.set_gain(6)
+        command.assert_called_once_with(6)
+        self.assertEqual(result, {"ok": True, "outputGainDb": 6, "applied": True})
+        self.assertEqual(self.plugin.settings["original"], {"outputGainDb": 6, "other": "preserve"})
+        self.assertEqual(len(saved), 1)
+
+    def test_gain_api_saves_for_next_start_when_worker_is_inactive(self):
+        self.plugin.settings["engine"]["kind"] = "original"
+        with patch.object(self.main.original_runtime, "apply_output_gain",
+                          return_value={"outputGainDb": 12, "applied": False}) as apply:
+            result = self.set_gain(12)
+        apply.assert_called_once_with(12)
+        self.assertEqual(self.plugin.settings["original"]["outputGainDb"], 12)
+        self.assertEqual(result, {"ok": True, "outputGainDb": 12, "applied": False})
+        self.assertEqual(self.events, ["save:original"])
+
+    def test_gain_api_restores_and_saves_previous_settings_when_apply_fails(self):
+        self.plugin.settings["engine"]["kind"] = "original"
+        previous = {"outputGainDb": 3, "other": "preserve"}
+        self.plugin.settings["original"] = copy.deepcopy(previous)
+        saved = []
+        self.plugin._save = lambda: saved.append(copy.deepcopy(self.plugin.settings["original"]))
+        with patch.object(self.main.original_runtime, "apply_output_gain", side_effect=RuntimeError("owned stream missing")):
+            with self.assertRaisesRegex(RuntimeError, "owned stream missing"):
+                self.set_gain(6)
+        self.assertEqual(saved, [{"outputGainDb": 6, "other": "preserve"}, previous])
+        self.assertEqual(self.plugin.settings["original"], previous)
+
+    def test_gain_api_first_save_failure_restores_memory_and_never_applies_volume(self):
+        self.plugin.settings["engine"]["kind"] = "original"
+        previous = {"outputGainDb": 3, "other": "preserve"}
+        self.plugin.settings["original"] = copy.deepcopy(previous)
+        def save():
+            raise RuntimeError("settings storage unavailable")
+        self.plugin._save = save
+        with patch.object(self.main.original_runtime, "apply_output_gain") as apply:
+            with self.assertRaisesRegex(RuntimeError, "settings storage unavailable"):
+                self.set_gain(6)
+        apply.assert_not_called()
+        self.assertEqual(self.plugin.settings["original"], previous)
+
 
 if __name__ == "__main__":
     unittest.main()
-

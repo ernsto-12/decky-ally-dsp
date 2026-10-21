@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import time
 import uuid
 from typing import Any, Dict
 
-from . import converted_runtime, hardware, paths
+from . import converted_runtime, hardware, paths, settings
+from .log import logger
 from .util import atomic_write_bytes, atomic_write_text, read_json, run, user_env, write_json
 
 ORIGINAL_DIR = os.path.join(paths.RUNTIME_DIR, "original")
@@ -267,6 +269,7 @@ def _route_after_ready_locked():
         raise RuntimeError("The physical output disappeared during startup")
     if not verify(0):
         raise RuntimeError("The original worker exited before routing was applied")
+    apply_output_gain()
     for stream in _inputs():
         if stream.get("sink") != physical["index"]:
             continue
@@ -358,12 +361,52 @@ def active_meta():
     return read_json(META_FILE)
 
 
+def validate_output_gain(value):
+    value = float(value)
+    if not math.isfinite(value) or not 0.0 <= value <= 12.0:
+        raise ValueError("Original output boost must be between 0 and 12 dB")
+    return value
+
+
+def output_gain_db():
+    return validate_output_gain(settings.load().get("original", {}).get("outputGainDb", 0.0))
+
+
+def apply_output_gain(value=None):
+    """Set only this service's playback stream; leave device/game volumes alone.
+
+    PulseAudio's integer volume is cubic: 65536 * 10**(dB/60). An absolute
+    integer avoids cumulative relative '+dB' changes on repeated starts.
+    This is a playback-level control, separate from the original DLL settings.
+    """
+    gain = output_gain_db() if value is None else validate_output_gain(value)
+    if not verify(0):
+        return {"outputGainDb": gain, "applied": False}
+    journal = read_json(ROUTING_FILE, {}) or {}
+    sinks = _sinks()
+    physical = next((x for x in sinks if x.get("name") == journal.get("physical_sink")), None)
+    candidates = [x for x in _inputs()
+                  if x.get("properties", {}).get("node.name") == NAMESPACE + ".playback"]
+    if len(candidates) != 1 or not physical or candidates[0].get("sink") != physical["index"]:
+        raise RuntimeError("The owned original playback stream is unavailable")
+    volume = str(round(65536 * 10 ** (gain / 60.0)))
+    _checked(["pactl", "set-sink-input-volume", str(candidates[0]["index"]), volume])
+    meta = active_meta()
+    if isinstance(meta, dict):
+        meta["outputGainDb"] = gain
+        try:
+            write_json(META_FILE, meta)
+        except OSError as error:
+            logger.warning("Could not update original output-level metadata: %s", error)
+    return {"outputGainDb": gain, "applied": True}
+
+
 def apply_preset(profile: str, voicing: str, pregain_db: float = 0.0, restart_unit: bool = True) -> Dict[str, Any]:
     config = _configuration()
     # Original assets carry an explicit verified profile; converted voicings do
     # not silently become unsupported original-DLL parameters.
     active = {"engine": "original", "profile": config.get("profile", "game"),
-              "voicing": config.get("voicing", "balanced"), "preGainDb": 0.0,
+              "voicing": config.get("voicing", "balanced"), "preGainDb": 0.0, "outputGainDb": output_gain_db(),
               "requestedConvertedPreset": {"profile": profile, "voicing": voicing, "preGainDb": pregain_db},
               "engineLabel": config.get("label"), "engineProfile": config["engine_profile"],
               "scope": config.get("scope"), "applied_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
@@ -377,8 +420,19 @@ def apply_preset(profile: str, voicing: str, pregain_db: float = 0.0, restart_un
 
 def status(with_journal: bool = True) -> Dict[str, Any]:
     state = read_json(STATUS_FILE, {}) or {}
+    dump = hardware.pw_dump()
+    names = {item.get("id"): item.get("info", {}).get("props", {}).get("node.name")
+             for item in dump if item.get("type") == "PipeWire:Interface:Node"}
+    links = {"input": 0, "output": 0}
+    for item in dump:
+        if item.get("type") != "PipeWire:Interface:Link":
+            continue
+        info = item.get("info", {})
+        if names.get(info.get("input-node-id")) == NAMESPACE + ".capture":
+            links["input"] += 1
+        if names.get(info.get("output-node-id")) == NAMESPACE + ".playback":
+            links["output"] += 1
     return {"unit_installed": os.path.isfile(paths.UNIT_PATH), "unit_current": unit_installed(),
             "enabled": converted_runtime.is_enabled(), "active": converted_runtime.is_active(),
-            "verified": verify(0), "links": {"input": len(state.get("capture_links", [])),
-                                             "output": len(state.get("playback_links", []))}, "active_preset": active_meta(),
+            "verified": verify(0), "links": links, "active_preset": active_meta(),
             "journal": converted_runtime.journal(12) if with_journal else "", "original": state}

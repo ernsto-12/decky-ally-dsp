@@ -18,6 +18,9 @@ class Device:
 
 def _device(monkeypatch, headphones, active):
     dev = Device(headphones, active)
+    # These tests exercise the converted chain. Do not read the real device's
+    # selected engine from its settings when running the suite on a handheld.
+    monkeypatch.setattr(jackwatch.dsp_runtime, "pause_for_headphones", lambda: True)
     monkeypatch.setattr(jackwatch.hardware, "pw_dump", lambda: [{}])
     monkeypatch.setattr(jackwatch.hardware, "output_route", lambda dump: None)
     monkeypatch.setattr(jackwatch.hardware, "headphones_active", lambda route: dev.headphones)

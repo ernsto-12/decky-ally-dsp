@@ -45,6 +45,7 @@ export interface EngineState {
 export interface Settings {
   enabled: boolean;
   engine?: { kind: EngineKind };
+  original?: { outputGainDb?: number };
   global: { profile: string; voicing: string };
   perApp: Record<string, PerAppEntry>;
   extras: Extras;

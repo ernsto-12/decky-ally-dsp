@@ -227,6 +227,25 @@ class Plugin:
                 raise RuntimeError(str(error) + suffix) from error
         return {"ok": True, "engine": await asyncio.to_thread(dsp_runtime.engine_status)}
 
+    async def set_original_gain(self, gain_db: float) -> Dict[str, Any]:
+        value = original_runtime.validate_output_gain(gain_db)
+        async with self.engine_lock:
+            if dsp_runtime.engine_kind() != "original":
+                raise RuntimeError("Select the original engine to change its output boost")
+            previous = dict(self.settings.get("original", {}))
+            self.settings.setdefault("original", {})["outputGainDb"] = value
+            saved = False
+            try:
+                self._save()
+                saved = True
+                result = await asyncio.to_thread(original_runtime.apply_output_gain, value)
+            except Exception:
+                self.settings["original"] = previous
+                if saved:
+                    self._save()
+                raise
+        return dict(result, ok=True)
+
     # ---------------------------------------------------------------- setup
     async def run_setup(self, force: bool = False, allow_unsupported: bool = False) -> Dict[str, Any]:
         if dsp_runtime.engine_kind() == "original":

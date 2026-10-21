@@ -70,8 +70,8 @@ PUBLIC_PINS = {
     "hrtf_adapter.py": "3ddf412d6ad731217d326d3350c059ef8487e5cd7f4aa482bde501119989ab19",
     "linux_client.py": "4d5a22c6b4892ac0b1b787330548987e91a2f68ff3152e7d859818d1f76bfa62",
     "local_property_store.py": "f5cfc1d90ce8c58ab70bf700a941645bed340ed4f54b31a41d4800473877c0b4",
-    "pipewire_bridge.py": "a5f07408bdb6a0e5727bb709ac0b582a46262bdf01a2cc51646bf94817e4c3af",
-    "pipewire_graph.py": "c5bf853b11f333b53f6e8c3c922aa4bf7e7ce03394c2a5f86137c043de396f3e",
+    "pipewire_bridge.py": "e8179c62b0c0315f4aa196ad39bc2ac1b01a710fb2a4a4034c0e21f364c86472",
+    "pipewire_graph.py": "78c77c460ffddaf24a423e220b5c3e4b431a22327ca9d6fcfa513899150ee93e",
     "protocol.py": "d4f6c7e0f48e3ae0396783cd91c6732f23a91966f15358a4713c2a614e76ccc4",
     "windows_worker.py": "bc7a7b9b32b789a4c5c38e6089f10994c2e41260a1774b05c843721a33a48f09"
 }

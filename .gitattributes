@@ -3,3 +3,5 @@
 *.jpg binary
 *.zip binary
 *.sig binary
+# Preserve the exact byte-pinned ABI host used by the engine asset verifier.
+py_modules/allydsp/original/frontend_adapter.py whitespace=-blank-at-eof
