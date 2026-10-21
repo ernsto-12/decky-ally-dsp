@@ -26,10 +26,18 @@ from allydsp.util import Result, read_json, write_json
 
 
 class AudioSession:
+    @staticmethod
+    def volume(values, *, surround=False):
+        channels = ["front-left", "front-right", "front-center", "lfe", "rear-left", "rear-right"] if surround else ["front-left", "front-right"]
+        if not isinstance(values, list):
+            values = [values] * len(channels)
+        assert len(values) == len(channels)
+        return {channel: {"value": value} for channel, value in zip(channels, values)}
+
     def __init__(self):
         self.sinks = [
-            {"name": "speaker", "index": 10, "owner_module": 1, "properties": {}},
-            {"name": "usb", "index": 20, "owner_module": 2, "properties": {}},
+            {"name": "speaker", "index": 10, "owner_module": 1, "properties": {"object.serial": "110"}, "volume": self.volume(65536), "mute": False},
+            {"name": "usb", "index": 20, "owner_module": 2, "properties": {"object.serial": "120"}, "volume": self.volume(65536), "mute": False},
         ]
         self.streams = [{"index": 100, "sink": 10, "properties": {
             "application.process.id": "123", "media.name": "Game", "object.serial": "1000"}}]
@@ -40,7 +48,8 @@ class AudioSession:
 
     def owned(self, token="session", module=42):
         self.sinks.append({"name": original.CAPTURE_SINK, "index": 99,
-                           "owner_module": module, "properties": {"allydsp.session": token}})
+                           "owner_module": module, "properties": {"allydsp.session": token},
+                           "volume": self.volume(65536, surround=True), "mute": False})
 
     def run(self, args, **kwargs):
         self.calls.append(tuple(args))
@@ -72,13 +81,25 @@ class AudioSession:
             self.sinks = [s for s in self.sinks if str(s["owner_module"]) != args[2]]
         elif op == "set-sink-input-volume":
             next(s for s in self.streams if s["index"] == int(args[2]))["volume_raw"] = int(args[3])
+        elif op == "set-sink-volume":
+            sink = next(s for s in self.sinks if s["name"] == args[2])
+            values = [int(value) for value in args[3:]]
+            if len(values) == 1:
+                values *= len(sink["volume"])
+            assert len(values) == len(sink["volume"])
+            for channel, value in zip(sink["volume"], values):
+                sink["volume"][channel]["value"] = value
+        elif op == "set-sink-mute":
+            sink = next(s for s in self.sinks if s["name"] == args[2])
+            assert args[3] in ("0", "1", "false", "true")
+            sink["mute"] = args[3] in ("1", "true")
         else:
             raise AssertionError("Unexpected pactl command: " + repr(args))
         return Result(0, "", "")
 
     def mutations(self):
         return [x for x in self.calls if x[1] in
-                ("set-default-sink", "move-sink-input", "load-module", "unload-module", "set-sink-input-volume")]
+                ("set-default-sink", "move-sink-input", "load-module", "unload-module", "set-sink-input-volume", "set-sink-volume", "set-sink-mute")]
 
 
 class OriginalRoutingTests(unittest.TestCase):
@@ -113,6 +134,19 @@ class OriginalRoutingTests(unittest.TestCase):
         self.audio.owned()
         self.audio.default = original.CAPTURE_SINK
         self.audio.streams[0]["sink"] = 99
+
+    def sink(self, name="speaker"):
+        return next(sink for sink in self.audio.sinks if sink["name"] == name)
+
+    def levels(self, name="speaker"):
+        return [channel["value"] for channel in self.sink(name)["volume"].values()]
+
+    def activate_handoff(self, *, volume=34734, mute=False):
+        self.sink()["volume"] = self.audio.volume(volume)
+        self.sink()["mute"] = mute
+        original._prepare_route_locked()
+        with patch.object(original, "verify", return_value=True):
+            original._route_after_ready_locked()
 
     def test_restore_recovers_default_and_each_original_stream_destination(self):
         self.routed()
@@ -182,7 +216,374 @@ class OriginalRoutingTests(unittest.TestCase):
         self.assertTrue(journal["token"])
         self.assertEqual(self.audio.default, "speaker")
         self.assertEqual(self.audio.streams[0]["sink"], 10)
-        self.assertEqual([x[1] for x in self.audio.mutations()], ["load-module"])
+        self.assertEqual(self.audio.mutations()[0][1], "load-module")
+        self.assertTrue(all(c[1] in ("set-sink-volume", "set-sink-mute") and c[2] == original.CAPTURE_SINK
+                            for c in self.audio.mutations()[1:]), "Preparation must leave games, default and physical master alone")
+
+    def test_virtual_master_inherits_physical_level_mute_and_stereo_balance_before_ready(self):
+        self.sink()["volume"] = self.audio.volume([32768, 49152])
+        self.sink()["mute"] = True
+        previous = copy.deepcopy(self.sink())
+        original._prepare_route_locked()
+        center = round(((32768 ** 3 + 49152 ** 3) / 2) ** (1 / 3))
+        self.assertEqual(self.levels(original.CAPTURE_SINK), [32768, 49152, center, center, 32768, 49152])
+        self.assertTrue(self.sink(original.CAPTURE_SINK)["mute"])
+        self.assertEqual(self.sink(), previous)
+        self.assertEqual(self.audio.default, "speaker")
+        self.assertEqual(self.audio.streams[0]["sink"], 10)
+        handoff = read_json(original.ROUTING_FILE)["volume_handoff"]
+        self.assertEqual(handoff["original"], {"volume": [32768, 49152], "mute": True})
+        self.assertFalse(handoff["volume"]["intent"])
+        self.assertFalse(handoff["mute"]["intent"])
+
+    def test_volume_change_during_worker_startup_is_resynced_before_route_and_restored(self):
+        self.sink()["volume"] = self.audio.volume(34734)
+        original._prepare_route_locked()
+        self.assertEqual(self.levels(original.CAPTURE_SINK), [34734] * 6)
+        # The user changes the still-default physical output while the worker initializes.
+        self.sink()["volume"] = self.audio.volume(39322)
+        self.sink()["mute"] = True
+        with patch.object(original, "verify", return_value=True):
+            original._route_after_ready_locked()
+        self.assertEqual(self.levels(original.CAPTURE_SINK), [39322] * 6)
+        self.assertTrue(self.sink(original.CAPTURE_SINK)["mute"])
+        self.assertEqual(self.levels(), [65536, 65536])
+        self.assertFalse(self.sink()["mute"])
+        self.assertEqual(read_json(original.ROUTING_FILE)["volume_handoff"]["original"],
+                         {"volume": [39322, 39322], "mute": True})
+        original._restore_routing_locked()
+        self.assertEqual(self.levels(), [39322, 39322])
+        self.assertTrue(self.sink()["mute"])
+
+    def test_repeating_active_route_does_not_replace_virtual_master_with_physical_unity(self):
+        self.activate_handoff(volume=34734)
+        self.sink(original.CAPTURE_SINK)["volume"] = self.audio.volume(40000, surround=True)
+        self.sink(original.CAPTURE_SINK)["mute"] = True
+        with patch.object(original, "verify", return_value=True):
+            original._route_after_ready_locked()
+        self.assertEqual(self.levels(original.CAPTURE_SINK), [40000] * 6)
+        self.assertTrue(self.sink(original.CAPTURE_SINK)["mute"])
+        self.assertEqual(self.levels(), [65536, 65536])
+        self.assertFalse(self.sink()["mute"])
+
+    def test_virtual_only_startup_volume_and_mute_changes_are_preserved(self):
+        self.sink()["volume"] = self.audio.volume(34734)
+        original._prepare_route_locked()
+        self.sink(original.CAPTURE_SINK)["volume"] = self.audio.volume(45000, surround=True)
+        self.sink(original.CAPTURE_SINK)["mute"] = True
+        with patch.object(original, "verify", return_value=True):
+            original._route_after_ready_locked()
+        self.assertEqual(self.levels(original.CAPTURE_SINK), [45000] * 6)
+        self.assertTrue(self.sink(original.CAPTURE_SINK)["mute"])
+        original._restore_routing_locked()
+        self.assertEqual(self.levels(), [45000, 45000])
+        self.assertTrue(self.sink()["mute"])
+
+    def test_conflicting_startup_volume_changes_fail_before_games_or_default_move(self):
+        self.sink()["volume"] = self.audio.volume(34734)
+        original._prepare_route_locked()
+        self.sink()["volume"] = self.audio.volume(39322)
+        self.sink(original.CAPTURE_SINK)["volume"] = self.audio.volume(45000, surround=True)
+        before = len(self.audio.calls)
+        with patch.object(original, "verify", return_value=True):
+            with self.assertRaises(RuntimeError):
+                original._route_after_ready_locked()
+        self.assertEqual(self.audio.default, "speaker")
+        self.assertEqual(self.audio.streams[0]["sink"], 10)
+        self.assertEqual(self.levels(), [39322, 39322])
+        self.assertFalse(any(c[1] in ("set-default-sink", "move-sink-input") for c in self.audio.calls[before:]))
+        original._restore_routing_locked()
+        self.assertEqual(self.levels(), [39322, 39322])
+
+    def test_independent_startup_physical_volume_and_virtual_mute_changes_are_merged(self):
+        self.sink()["volume"] = self.audio.volume(34734)
+        original._prepare_route_locked()
+        self.sink()["volume"] = self.audio.volume(39322)
+        self.sink(original.CAPTURE_SINK)["mute"] = True
+        with patch.object(original, "verify", return_value=True):
+            original._route_after_ready_locked()
+        self.assertEqual(self.levels(original.CAPTURE_SINK), [39322] * 6)
+        self.assertTrue(self.sink(original.CAPTURE_SINK)["mute"])
+        original._restore_routing_locked()
+        self.assertEqual(self.levels(), [39322, 39322])
+        self.assertTrue(self.sink()["mute"])
+
+    def test_equal_startup_volume_changes_on_both_masters_are_not_a_conflict(self):
+        self.sink()["volume"] = self.audio.volume(34734)
+        original._prepare_route_locked()
+        self.sink()["volume"] = self.audio.volume(39322)
+        self.sink(original.CAPTURE_SINK)["volume"] = self.audio.volume(39322, surround=True)
+        with patch.object(original, "verify", return_value=True):
+            original._route_after_ready_locked()
+        self.assertEqual(self.levels(original.CAPTURE_SINK), [39322] * 6)
+        original._restore_routing_locked()
+        self.assertEqual(self.levels(), [39322, 39322])
+
+    def test_legacy_routing_journal_restores_routes_without_owning_any_master_volume(self):
+        self.routed()  # A pre-handoff journal has no volume_handoff section.
+        self.sink()["volume"] = self.audio.volume([30000, 35000])
+        self.sink()["mute"] = True
+        original._restore_routing_locked()
+        self.assertEqual(self.levels(), [30000, 35000])
+        self.assertTrue(self.sink()["mute"])
+        self.assertFalse(any(c[1] in ("set-sink-volume", "set-sink-mute") for c in self.audio.calls))
+        self.assertTrue(read_json(original.ROUTING_FILE)["restored"])
+
+    def test_physical_unity_and_unmute_happen_only_after_games_and_default_move(self):
+        self.sink()["volume"] = self.audio.volume(34734)
+        self.sink()["mute"] = True
+        original._prepare_route_locked()
+        events = []
+        def run(args, **kwargs):
+            if args[1] in ("set-sink-volume", "set-sink-mute") and args[2] == "speaker":
+                self.assertEqual(self.audio.default, original.CAPTURE_SINK)
+                self.assertEqual(self.audio.streams[0]["sink"], 99)
+                key = "volume" if args[1] == "set-sink-volume" else "mute"
+                stage = read_json(original.ROUTING_FILE)["volume_handoff"][key]
+                self.assertTrue(stage["intent"], "A completed command must remain recoverable after a crash")
+                self.assertFalse(stage["applied"])
+                events.append(key)
+            return self.audio.run(args, **kwargs)
+        with patch.object(original, "run", side_effect=run), patch.object(original, "verify", return_value=True):
+            original._route_after_ready_locked()
+        self.assertEqual(events, ["volume", "mute"])
+        self.assertEqual(self.levels(), [65536, 65536])
+        self.assertFalse(self.sink()["mute"])
+        self.assertEqual(self.levels(original.CAPTURE_SINK), [34734] * 6)
+        self.assertTrue(self.sink(original.CAPTURE_SINK)["mute"], "An initially muted output must stay muted to the listener")
+
+    def test_restore_transfers_current_virtual_volume_and_mute_back_before_unload(self):
+        self.activate_handoff()
+        self.sink(original.CAPTURE_SINK)["volume"] = self.audio.volume(45000, surround=True)
+        self.sink(original.CAPTURE_SINK)["mute"] = True
+        def run(args, **kwargs):
+            if args[1] == "unload-module":
+                self.assertEqual(self.levels(), [45000, 45000])
+                self.assertTrue(self.sink()["mute"])
+            return self.audio.run(args, **kwargs)
+        with patch.object(original, "run", side_effect=run):
+            original._restore_routing_locked()
+        self.assertEqual(self.audio.default, "speaker")
+        self.assertEqual(self.audio.streams[0]["sink"], 10)
+        self.assertTrue(read_json(original.ROUTING_FILE)["restored"])
+
+    def test_restore_respects_external_physical_volume_change_but_still_restores_mute(self):
+        self.activate_handoff()
+        self.sink(original.CAPTURE_SINK)["volume"] = self.audio.volume(45000, surround=True)
+        self.sink(original.CAPTURE_SINK)["mute"] = True
+        self.sink()["volume"] = self.audio.volume([30000, 31000])
+        before = len(self.audio.calls)
+        original._restore_routing_locked()
+        self.assertEqual(self.levels(), [30000, 31000])
+        self.assertTrue(self.sink()["mute"])
+        self.assertFalse(any(c[1] == "set-sink-volume" and c[2] == "speaker" for c in self.audio.calls[before:]))
+        self.assertTrue(read_json(original.ROUTING_FILE)["volume_handoff"]["restore"]["volume"]["preserved_external"])
+
+    def test_restore_respects_external_physical_mute_change_but_still_restores_volume(self):
+        self.activate_handoff()
+        self.sink(original.CAPTURE_SINK)["volume"] = self.audio.volume(45000, surround=True)
+        self.sink(original.CAPTURE_SINK)["mute"] = False
+        self.sink()["mute"] = True
+        before = len(self.audio.calls)
+        original._restore_routing_locked()
+        self.assertEqual(self.levels(), [45000, 45000])
+        self.assertTrue(self.sink()["mute"])
+        self.assertFalse(any(c[1] == "set-sink-mute" and c[2] == "speaker" for c in self.audio.calls[before:]))
+        self.assertTrue(read_json(original.ROUTING_FILE)["volume_handoff"]["restore"]["mute"]["preserved_external"])
+
+    def test_virtual_sink_disappearance_restores_original_physical_level_instead_of_unity(self):
+        self.activate_handoff(volume=34734, mute=True)
+        self.audio.sinks = [sink for sink in self.audio.sinks if sink["name"] != original.CAPTURE_SINK]
+        self.audio.streams = []
+        original._restore_routing_locked()
+        self.assertEqual(self.levels(), [34734, 34734])
+        self.assertTrue(self.sink()["mute"])
+        self.assertEqual(self.audio.default, "speaker")
+
+    def test_crash_after_physical_command_before_applied_commit_is_recoverable(self):
+        class Crash(BaseException):
+            pass
+        for operation in ("set-sink-volume", "set-sink-mute"):
+            with self.subTest(operation=operation):
+                # Start each subcase with a distinct clean session and journal.
+                self.audio = AudioSession()
+                original.run = self.audio.run
+                Path(original.ROUTING_FILE).unlink(missing_ok=True)
+                self.sink()["volume"] = self.audio.volume(34734)
+                self.sink()["mute"] = True
+                original._prepare_route_locked()
+                def crash(args, **kwargs):
+                    result = self.audio.run(args, **kwargs)
+                    if args[1] == operation and args[2] == "speaker":
+                        raise Crash()
+                    return result
+                with patch.object(original, "run", side_effect=crash), patch.object(original, "verify", return_value=True):
+                    with self.assertRaises(Crash):
+                        original._route_after_ready_locked()
+                key = "volume" if operation == "set-sink-volume" else "mute"
+                pending = read_json(original.ROUTING_FILE)["volume_handoff"][key]
+                self.assertTrue(pending["intent"])
+                self.assertFalse(pending["applied"])
+                original._restore_routing_locked()
+                self.assertEqual(self.levels(), [34734, 34734])
+                self.assertTrue(self.sink()["mute"])
+                self.assertTrue(read_json(original.ROUTING_FILE)["restored"])
+
+    def test_restore_target_is_journaled_before_write_and_does_not_follow_later_virtual_changes(self):
+        class Crash(BaseException):
+            pass
+        self.activate_handoff()
+        self.sink(original.CAPTURE_SINK)["volume"] = self.audio.volume(43000, surround=True)
+        def crash(args, **kwargs):
+            if args[1] == "set-sink-volume" and args[2] == "speaker":
+                restore = read_json(original.ROUTING_FILE)["volume_handoff"]["restore"]["volume"]
+                self.assertTrue(restore["intent"])
+                self.assertEqual(restore["target"], [43000, 43000])
+                result = self.audio.run(args, **kwargs)
+                raise Crash()
+            return self.audio.run(args, **kwargs)
+        with patch.object(original, "run", side_effect=crash):
+            with self.assertRaises(Crash):
+                original._restore_routing_locked()
+        self.sink(original.CAPTURE_SINK)["volume"] = self.audio.volume(55000, surround=True)
+        original._restore_routing_locked()
+        self.assertEqual(self.levels(), [43000, 43000])
+        self.assertTrue(read_json(original.ROUTING_FILE)["restored"])
+
+    def test_missing_physical_serial_fails_before_creating_or_changing_audio_nodes(self):
+        del self.sink()["properties"]["object.serial"]
+        with self.assertRaises(RuntimeError):
+            original._prepare_route_locked()
+        self.assertEqual(self.audio.mutations(), [])
+
+    def test_replacement_physical_identity_does_not_receive_saved_master_settings(self):
+        self.activate_handoff()
+        self.sink(original.CAPTURE_SINK)["volume"] = self.audio.volume(45000, surround=True)
+        self.sink(original.CAPTURE_SINK)["mute"] = True
+        self.sink()["index"] = 30
+        self.sink()["properties"]["object.serial"] = "replacement"
+        before = len(self.audio.calls)
+        original._restore_routing_locked()
+        self.assertEqual(self.levels(), [65536, 65536])
+        self.assertFalse(self.sink()["mute"])
+        self.assertFalse(any(c[1] in ("set-sink-volume", "set-sink-mute") and c[2] == "speaker"
+                             for c in self.audio.calls[before:]))
+
+    def test_failed_intent_journal_write_cannot_change_physical_master(self):
+        self.sink()["volume"] = self.audio.volume(34734)
+        self.sink()["mute"] = True
+        original._prepare_route_locked()
+        real_write = original.write_json
+        def fail(path, value):
+            stage = value.get("volume_handoff", {}).get("volume", {})
+            if path == original.ROUTING_FILE and stage.get("intent") and not stage.get("applied"):
+                raise OSError("journal unavailable")
+            return real_write(path, value)
+        before = len(self.audio.calls)
+        with patch.object(original, "write_json", side_effect=fail), patch.object(original, "verify", return_value=True):
+            with self.assertRaisesRegex(OSError, "journal unavailable"):
+                original._route_after_ready_locked()
+        self.assertEqual(self.levels(), [34734, 34734])
+        self.assertTrue(self.sink()["mute"])
+        self.assertFalse(any(c[1] in ("set-sink-volume", "set-sink-mute") and c[2] == "speaker"
+                             for c in self.audio.calls[before:]))
+        original._restore_routing_locked()
+        self.assertTrue(read_json(original.ROUTING_FILE)["restored"])
+
+    def test_failed_physical_handoff_command_can_restore_without_leaving_unity(self):
+        for operation in ("set-sink-volume", "set-sink-mute"):
+            with self.subTest(operation=operation):
+                self.audio = AudioSession()
+                original.run = self.audio.run
+                Path(original.ROUTING_FILE).unlink(missing_ok=True)
+                self.sink()["volume"] = self.audio.volume(34734)
+                self.sink()["mute"] = True
+                original._prepare_route_locked()
+                def fail(args, **kwargs):
+                    if args[1] == operation and args[2] == "speaker":
+                        return Result(1, "", "physical volume command rejected")
+                    return self.audio.run(args, **kwargs)
+                with patch.object(original, "run", side_effect=fail), patch.object(original, "verify", return_value=True):
+                    with self.assertRaisesRegex(RuntimeError, "physical volume command rejected"):
+                        original._route_after_ready_locked()
+                original._restore_routing_locked()
+                self.assertEqual(self.levels(), [34734, 34734])
+                self.assertTrue(self.sink()["mute"])
+                self.assertEqual(self.audio.default, "speaker")
+                self.assertTrue(read_json(original.ROUTING_FILE)["restored"])
+
+    def test_failed_master_restore_keeps_virtual_sink_and_journal_for_retry(self):
+        self.activate_handoff()
+        self.sink(original.CAPTURE_SINK)["volume"] = self.audio.volume(45000, surround=True)
+        def fail(args, **kwargs):
+            if args[1] == "set-sink-volume" and args[2] == "speaker":
+                return Result(1, "", "restore volume rejected")
+            return self.audio.run(args, **kwargs)
+        before = len(self.audio.calls)
+        with patch.object(original, "run", side_effect=fail):
+            with self.assertRaisesRegex(RuntimeError, "restore volume rejected"):
+                original._restore_routing_locked()
+        self.assertFalse(read_json(original.ROUTING_FILE)["restored"])
+        self.assertEqual(self.audio.default, original.CAPTURE_SINK)
+        self.assertTrue(any(s["name"] == original.CAPTURE_SINK for s in self.audio.sinks))
+        self.assertFalse(any(c[1] == "unload-module" for c in self.audio.calls[before:]))
+        original._restore_routing_locked()
+        self.assertEqual(self.levels(), [45000, 45000])
+        self.assertTrue(read_json(original.ROUTING_FILE)["restored"])
+
+    def test_repeated_handoff_cycles_transfer_master_values_without_accumulation(self):
+        self.activate_handoff(volume=34734)
+        self.sink(original.CAPTURE_SINK)["volume"] = self.audio.volume(40000, surround=True)
+        original._restore_routing_locked()
+        self.assertEqual(self.levels(), [40000, 40000])
+        original._prepare_route_locked()
+        self.assertEqual(self.levels(original.CAPTURE_SINK), [40000] * 6)
+        with patch.object(original, "verify", return_value=True):
+            original._route_after_ready_locked()
+        self.assertEqual(self.levels(), [65536, 65536])
+        original._restore_routing_locked()
+        self.assertEqual(self.levels(), [40000, 40000])
+
+    def test_uncommitted_unity_rounding_after_crash_still_restores_original_master(self):
+        class Crash(BaseException):
+            pass
+        self.sink()["volume"] = self.audio.volume(34734)
+        original._prepare_route_locked()
+        def crash(args, **kwargs):
+            result = self.audio.run(args, **kwargs)
+            if args[1] == "set-sink-volume" and args[2] == "speaker":
+                self.sink()["volume"] = self.audio.volume(65533)
+                raise Crash()
+            return result
+        with patch.object(original, "run", side_effect=crash), patch.object(original, "verify", return_value=True):
+            with self.assertRaises(Crash):
+                original._route_after_ready_locked()
+        pending = read_json(original.ROUTING_FILE)["volume_handoff"]["volume"]
+        self.assertFalse(pending["applied"])
+        self.assertEqual(pending["expected"], [65536, 65536])
+        original._restore_routing_locked()
+        self.assertEqual(self.levels(), [34734, 34734])
+        self.assertTrue(read_json(original.ROUTING_FILE)["restored"])
+
+    def test_committed_unity_uses_actual_readback_and_preserves_even_small_external_changes(self):
+        self.sink()["volume"] = self.audio.volume(34734)
+        original._prepare_route_locked()
+        def rounded(args, **kwargs):
+            result = self.audio.run(args, **kwargs)
+            if args[1] == "set-sink-volume" and args[2] == "speaker":
+                self.sink()["volume"] = self.audio.volume(65533)
+            return result
+        with patch.object(original, "run", side_effect=rounded), patch.object(original, "verify", return_value=True):
+            original._route_after_ready_locked()
+        committed = read_json(original.ROUTING_FILE)["volume_handoff"]["volume"]
+        self.assertTrue(committed["applied"])
+        self.assertEqual(committed["expected"], [65533, 65533])
+        self.sink()["volume"] = self.audio.volume(65536)
+        before = len(self.audio.calls)
+        original._restore_routing_locked()
+        self.assertEqual(self.levels(), [65536, 65536])
+        self.assertFalse(any(c[1] == "set-sink-volume" and c[2] == "speaker" for c in self.audio.calls[before:]))
+        self.assertTrue(read_json(original.ROUTING_FILE)["volume_handoff"]["restore"]["volume"]["preserved_external"])
 
     def test_dead_worker_cannot_take_over_default_or_streams(self):
         original._prepare_route_locked()

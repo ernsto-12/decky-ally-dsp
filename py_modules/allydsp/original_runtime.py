@@ -220,6 +220,177 @@ def _owns_sink(sink, journal):
                 sink.get("properties", {}).get("allydsp.session") == journal["token"])
 
 
+_STEREO_CHANNELS = ("front-left", "front-right")
+
+
+def _sink_volume(sink, channels):
+    values = []
+    for channel in channels:
+        value = sink.get("volume", {}).get(channel, {}).get("value")
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2147483647:
+            raise RuntimeError("The audio output has no valid absolute channel volume")
+        values.append(value)
+    return values
+
+
+def _sink_mute(sink):
+    value = sink.get("mute")
+    if not isinstance(value, bool):
+        raise RuntimeError("The audio output has no valid mute state")
+    return value
+
+
+def _physical_identity(sink):
+    return {"name": sink.get("name"), "index": sink.get("index"),
+            "serial": sink.get("properties", {}).get("object.serial")}
+
+
+def _same_physical(sink, handoff):
+    expected = handoff["physical_identity"]
+    actual = _physical_identity(sink) if sink else {}
+    return all(actual.get(key) is not None and str(actual[key]) == str(expected.get(key))
+               for key in ("name", "index", "serial"))
+
+
+def _volume_handoff(journal):
+    handoff = journal.get("volume_handoff")
+    if handoff is None:
+        return None  # Journals from before master-volume handoff own no levels.
+    if handoff.get("schema") != "ally-dsp-original-volume-handoff-v1":
+        raise RuntimeError("Unknown original audio volume-recovery journal")
+    return handoff
+
+
+def _surround_volume(volume):
+    left, right = volume
+    center = round(((left ** 3 + right ** 3) / 2) ** (1 / 3))
+    return [left, right, center, center, left, right]
+
+
+def _sync_virtual_master(journal, phase):
+    handoff = _volume_handoff(journal)
+    if handoff is None or journal.get("routed") or any(handoff[key].get("intent") for key in ("volume", "mute")):
+        return
+    sinks = _sinks()
+    owned = next((sink for sink in sinks if sink.get("name") == CAPTURE_SINK), None)
+    physical = next((sink for sink in sinks if sink.get("name") == journal["physical_sink"]), None)
+    if not _owns_sink(owned, journal) or not _same_physical(physical, handoff):
+        raise RuntimeError("Audio output ownership changed before copying the master volume")
+    latest = {"volume": _sink_volume(physical, _STEREO_CHANNELS), "mute": _sink_mute(physical)}
+    target = {"volume": _surround_volume(latest["volume"]), "mute": latest["mute"]}
+    if phase == "ready":
+        current = {"volume": _sink_volume(owned, (*_STEREO_CHANNELS, "front-center", "lfe", "rear-left", "rear-right")),
+                   "mute": _sink_mute(owned)}
+        for control in ("volume", "mute"):
+            virtual_changed = current[control] != handoff["virtual_initial"][control]
+            physical_changed = latest[control] != handoff["original"][control]
+            if virtual_changed and physical_changed and current[control] != target[control]:
+                raise RuntimeError("Both output masters changed during startup; volume handoff was cancelled")
+            if virtual_changed and not physical_changed:
+                target[control] = current[control]
+    # READY may take seconds. Preserve the most recent physical state and any
+    # independent virtual adjustment before moving a game or taking its master.
+    handoff.update(original=latest, virtual_initial=target, virtual_sync_phase=phase)
+    write_json(ROUTING_FILE, journal)
+    for control in ("volume", "mute"):
+        current_owned = next((sink for sink in _sinks() if sink.get("name") == CAPTURE_SINK), None)
+        if not _owns_sink(current_owned, journal):
+            raise RuntimeError("The virtual output changed during initial master-volume copy")
+        handoff["virtual_" + control + "_intent"] = True
+        write_json(ROUTING_FILE, journal)
+        args = (["pactl", "set-sink-volume", CAPTURE_SINK, *map(str, target[control])] if control == "volume"
+                else ["pactl", "set-sink-mute", CAPTURE_SINK, "1" if target[control] else "0"])
+        _checked(args)
+    # Keep actual Pulse integer rounding as the baseline for conflict detection.
+    current_owned = next((sink for sink in _sinks() if sink.get("name") == CAPTURE_SINK), None)
+    if not _owns_sink(current_owned, journal):
+        raise RuntimeError("The virtual output changed after initial master-volume copy")
+    handoff["virtual_initial"] = {
+        "volume": _sink_volume(current_owned, (*_STEREO_CHANNELS, "front-center", "lfe", "rear-left", "rear-right")),
+        "mute": _sink_mute(current_owned)}
+    write_json(ROUTING_FILE, journal)
+
+
+def _handoff_physical_master(journal):
+    handoff = _volume_handoff(journal)
+    if handoff is None:
+        return
+    for control, desired in (("volume", [65536, 65536]), ("mute", False)):
+        step = handoff[control]
+        if step.get("applied"):
+            continue
+        if step.get("intent"):
+            raise RuntimeError("An unfinished master-volume handoff needs recovery")
+        sinks = _sinks()
+        owned = next((sink for sink in sinks if sink.get("name") == CAPTURE_SINK), None)
+        physical = next((sink for sink in sinks if sink.get("name") == journal["physical_sink"]), None)
+        if not _owns_sink(owned, journal) or not _same_physical(physical, handoff):
+            raise RuntimeError("Audio output ownership changed before master-volume handoff")
+        # Persist ownership and the intended value before either physical change.
+        # Recovery also handles a crash after pactl but before the applied write.
+        step.update(intent=True, expected=desired)
+        write_json(ROUTING_FILE, journal)
+        args = (["pactl", "set-sink-volume", physical["name"], *map(str, desired)] if control == "volume"
+                else ["pactl", "set-sink-mute", physical["name"], "0"])
+        _checked(args)
+        current = next((sink for sink in _sinks() if sink.get("name") == physical["name"]), None)
+        if not _same_physical(current, handoff):
+            raise RuntimeError("The physical output changed during master-volume handoff")
+        actual = _sink_volume(current, _STEREO_CHANNELS) if control == "volume" else _sink_mute(current)
+        # Pulse's float conversion may round unity by a few raw integer units.
+        if (control == "volume" and any(abs(value - 65536) > 4 for value in actual)) or (control == "mute" and actual):
+            raise RuntimeError("The physical output did not accept the master-volume handoff")
+        step.update(expected=actual, applied=True)
+        write_json(ROUTING_FILE, journal)
+
+
+def _restore_physical_master(journal, owned):
+    handoff = _volume_handoff(journal)
+    if handoff is None or not any(handoff[key].get("intent") for key in ("volume", "mute")):
+        return
+    if owned is not None and not _owns_sink(owned, journal):
+        raise RuntimeError("The original sink was replaced before volume recovery")
+    if "restore" not in handoff:
+        # Freeze both targets before the first mutation so retries never derive
+        # a new target from an already-restored/replaced/disappeared sink.
+        target = ({"volume": _sink_volume(owned, _STEREO_CHANNELS), "mute": _sink_mute(owned)}
+                  if owned else handoff["original"])
+        handoff["restore"] = {key: {"target": target[key], "intent": False, "done": False}
+                              for key in ("volume", "mute")}
+        handoff["restore_source"] = "owned-virtual" if owned else "original-physical-fallback"
+        write_json(ROUTING_FILE, journal)
+    for control in ("volume", "mute"):
+        step = handoff["restore"][control]
+        if step.get("done") or not handoff[control].get("intent"):
+            continue
+        sinks = _sinks()
+        current_owned = next((sink for sink in sinks if sink.get("name") == CAPTURE_SINK), None)
+        if current_owned is not None and not _owns_sink(current_owned, journal):
+            raise RuntimeError("The original sink was replaced during volume recovery")
+        physical = next((sink for sink in sinks if sink.get("name") == journal["physical_sink"]), None)
+        if physical is None:
+            raise RuntimeError("The physical output is unavailable; volume recovery is pending")
+        if not _same_physical(physical, handoff):
+            step.update(done=True, preserved_external=True, reason="physical-identity-changed")
+        else:
+            actual = _sink_volume(physical, _STEREO_CHANNELS) if control == "volume" else _sink_mute(physical)
+            if actual == step["target"]:
+                step.update(done=True, already_at_target=True)
+            elif (actual != handoff[control]["expected"]
+                  and not (control == "volume" and not handoff[control].get("applied")
+                           and handoff[control]["expected"] == [65536, 65536]
+                           and all(abs(value - 65536) <= 4 for value in actual))):
+                step.update(done=True, preserved_external=True)
+            else:
+                step["intent"] = True
+                write_json(ROUTING_FILE, journal)
+                args = (["pactl", "set-sink-volume", physical["name"], *map(str, step["target"])] if control == "volume"
+                        else ["pactl", "set-sink-mute", physical["name"], "1" if step["target"] else "0"])
+                _checked(args)
+                step["done"] = True
+        write_json(ROUTING_FILE, journal)
+
+
 def _restore_routing_locked() -> None:
     journal = read_json(ROUTING_FILE)
     if not isinstance(journal, dict) or journal.get("schema") != "ally-dsp-original-routing-v1" or journal.get("restored"):
@@ -235,6 +406,9 @@ def _restore_routing_locked() -> None:
         destination = journal.get("physical_sink")
     if destination not in names or destination == CAPTURE_SINK:
         raise RuntimeError("The previous output is unavailable; routing recovery is pending")
+    # Restore the audible master before any application can reach the physical
+    # output directly again. Volume and mute each respect external changes.
+    _restore_physical_master(journal, owned)
     if current_default == CAPTURE_SINK:
         _checked(["pactl", "set-default-sink", destination])
     original_routes = {str(s["index"]): s for s in journal.get("moved", [])}
@@ -270,6 +444,7 @@ def _route_after_ready_locked():
     if not verify(0):
         raise RuntimeError("The original worker exited before routing was applied")
     apply_output_gain()
+    _sync_virtual_master(journal, "ready")
     for stream in _inputs():
         if stream.get("sink") != physical["index"]:
             continue
@@ -283,6 +458,7 @@ def _route_after_ready_locked():
         if not result.ok and any(s.get("index") == stream["index"] for s in _inputs()):
             raise RuntimeError(result.err.strip() or "Could not route an active audio stream")
     _checked(["pactl", "set-default-sink", CAPTURE_SINK])
+    _handoff_physical_master(journal)
     journal["routed"] = True
     write_json(ROUTING_FILE, journal)
 
@@ -295,13 +471,24 @@ def _prepare_route_locked():
     target = hardware.find_speaker_sink(hardware.pw_dump())
     if not target:
         raise RuntimeError("No supported physical analog output is available")
+    physical = next((sink for sink in sinks if sink.get("name") == target["name"]), None)
+    if physical is None or _physical_identity(physical)["serial"] is None:
+        raise RuntimeError("The physical output has no stable session identity")
+    volume, mute = _sink_volume(physical, _STEREO_CHANNELS), _sink_mute(physical)
+    virtual_volume = _surround_volume(volume)
     previous = _checked(["pactl", "get-default-sink"])
     if previous == CAPTURE_SINK:
         raise RuntimeError("A previous original-engine route needs recovery")
     os.makedirs(ORIGINAL_DIR, exist_ok=True)
     journal = {"schema": "ally-dsp-original-routing-v1", "previous_default": previous,
                "physical_sink": target["name"], "module_id": None, "moved": [], "restored": False,
-               "token": uuid.uuid4().hex}
+               "token": uuid.uuid4().hex,
+               "volume_handoff": {"schema": "ally-dsp-original-volume-handoff-v1",
+                   "physical_identity": _physical_identity(physical),
+                   "original": {"volume": volume, "mute": mute},
+                   "virtual_initial": {"volume": virtual_volume, "mute": mute},
+                   "volume": {"intent": False, "applied": False},
+                   "mute": {"intent": False, "applied": False}}}
     write_json(ROUTING_FILE, journal)
     module = _checked(["pactl", "load-module", "module-null-sink", "sink_name=" + CAPTURE_SINK,
                            "rate=48000", "channels=6", "channel_map=front-left,front-right,front-center,lfe,rear-left,rear-right",
@@ -310,6 +497,7 @@ def _prepare_route_locked():
         raise RuntimeError("PipeWire returned an invalid sink module identifier")
     journal["module_id"] = int(module)
     write_json(ROUTING_FILE, journal)
+    _sync_virtual_master(journal, "prepare")
 
 
 def start() -> bool:
