@@ -10,7 +10,7 @@ import pytest
 from allydsp import original_assets as assets
 
 PUBLIC_NAMES = {"protocol.py", "windows_worker.py", "linux_client.py", "pipewire_bridge.py",
-                "pipewire_graph.py", "hrtf_adapter.py", "frontend_adapter.py", "local_property_store.py"}
+                "pipewire_graph.py", "hrtf_adapter.py", "frontend_adapter.py", "local_property_store.py", "vlldp_adapter.py"}
 
 
 def digest(data):
@@ -82,7 +82,7 @@ def test_reimport_is_idempotent_and_preserves_generation(pack):
     assert len(list((runtime / "original/assets").iterdir())) == 1
 
 
-@pytest.mark.parametrize("component,name", [("source_dir", "DolbyAudioProcessing.dll"), ("source_dir", "speaker-game-output-spatial.bin"), ("public_dir", "windows_worker.py"), ("python_dir", "python312.dll")])
+@pytest.mark.parametrize("component,name", [("source_dir", "DolbyAudioProcessing.dll"), ("source_dir", "speaker-game-supported-cp.bin"), ("source_dir", "DolbyDAXVLLDP160.dll"), ("source_dir", "speaker-game-vlldp-plan.json"), ("source_dir", "audioeng.dll"), ("public_dir", "windows_worker.py"), ("python_dir", "python312.dll")])
 def test_invalid_pin_never_replaces_existing_manifest(pack, component, name):
     arguments, runtime, _ = pack
     destination = runtime / "original/engine.json"
@@ -95,7 +95,7 @@ def test_invalid_pin_never_replaces_existing_manifest(pack, component, name):
     assert not (runtime / "original/assets").exists()
 
 
-@pytest.mark.parametrize("component,name", [("source_dir", "game-init-source.bin"), ("source_dir", "speaker-game-output-spatial.bin"), ("python_dir", "python312.zip"), ("public_dir", "frontend_adapter.py")])
+@pytest.mark.parametrize("component,name", [("source_dir", "game-init-source.bin"), ("source_dir", "speaker-game-supported-cp.bin"), ("source_dir", "DolbyDAXVLLDP160.dll"), ("source_dir", "speaker-game-vlldp-plan.json"), ("source_dir", "audioeng.dll"), ("python_dir", "python312.zip"), ("public_dir", "frontend_adapter.py")])
 def test_incomplete_pack_is_rejected(pack, component, name):
     arguments, runtime, _ = pack
     (arguments[component] / name).unlink()
@@ -202,7 +202,7 @@ def test_proton_windows_path_keeps_spaces_as_one_token():
 def test_release_pin_metadata_contains_no_assets():
     assert set(assets.PUBLIC_PINS) == PUBLIC_NAMES
     assert {"python.exe", "python312.dll", "python312.zip", "LICENSE.txt"}.issubset(assets.PYTHON_PINS)
-    assert len(assets.VENDOR_PINS) == 6
+    assert len(assets.VENDOR_PINS) == 9
     for pin in [*assets.VENDOR_PINS.values(), *assets.PYTHON_PINS.values(), *assets.PUBLIC_PINS.values()]:
         assert len(pin) == 64 and all(char in "0123456789abcdef" for char in pin)
 
@@ -218,7 +218,14 @@ def test_release_public_source_bytes_and_internal_adapter_pins_match():
     assert pins["adapter"] == assets.PUBLIC_PINS["frontend_adapter.py"]
     assert pins["property_store"] == assets.PUBLIC_PINS["local_property_store.py"]
     assert pins["hrtf-headphones"] == assets.VENDOR_PINS["headphone-game-output-spatial-rendering.bin"]
-    assert pins["hrtf-speakers"] == assets.VENDOR_PINS["speaker-game-output-spatial.bin"]
+    assert pins["hrtf-speakers"] == assets.VENDOR_PINS["speaker-game-supported-cp.bin"]
+    worker = ast.parse((public / "windows_worker.py").read_text(encoding="utf-8"))
+    post_pins = next(ast.literal_eval(node.value) for node in worker.body
+                    if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "POST_PINS" for target in node.targets))
+    assert post_pins["adapter"] == assets.PUBLIC_PINS["vlldp_adapter.py"]
+    assert post_pins["dll"] == assets.VENDOR_PINS["DolbyDAXVLLDP160.dll"]
+    assert post_pins["plan"] == assets.VENDOR_PINS["speaker-game-vlldp-plan.json"]
+    assert post_pins["shim"] == assets.VENDOR_PINS["audioeng.dll"]
 
 
 def test_two_profiles_share_verified_assets_and_select_distinct_runtime_modes(pack):
@@ -233,14 +240,20 @@ def test_two_profiles_share_verified_assets_and_select_distinct_runtime_modes(pa
     assert hp["voicing"] == "official-headphones" and speaker["voicing"] == "official-speakers"
     assert hp["profile"] == speaker["profile"] == "game"
     assert hp["worker"]["cwd"] == speaker["worker"]["cwd"]
-    assert hp["worker"]["environment"] == speaker["worker"]["environment"]
+    hp_env, speaker_env = hp["worker"]["environment"], speaker["worker"]["environment"]
+    assert {key: value for key, value in hp_env.items() if key != "WINEDLLOVERRIDES"} == {key: value for key, value in speaker_env.items() if key != "WINEDLLOVERRIDES"}
+    assert speaker_env["WINEDLLOVERRIDES"] == hp_env["WINEDLLOVERRIDES"] + ";audioeng=n"
     assert "binaural stereo" in hp["scope"]
-    assert speaker["scope"] == "Official Speaker Game spatial configuration; 5.1 PCM → stereo. Device speaker calibration equivalence and Atmos object metadata are not established."
+    assert speaker["scope"] == assets.SPEAKER_SCOPE
     for item, engine, blob in [(hp, "hrtf-headphones", "headphone-game-output-spatial-rendering.bin"),
-                               (speaker, "hrtf-speakers", "speaker-game-output-spatial.bin")]:
+                               (speaker, "hrtf-speakers", "speaker-game-supported-cp.bin")]:
         command = item["worker"]["command"]
         assert command[command.index("--engine") + 1] == engine
         assert command[command.index("--runtime-blob") + 1].endswith("\\original\\" + blob)
     differences = [index for index, (a, b) in enumerate(zip(hp["worker"]["command"], speaker["worker"]["command"])) if a != b]
     assert differences == [hp["worker"]["command"].index("--engine") + 1,
                            hp["worker"]["command"].index("--runtime-blob") + 1]
+    assert len(speaker["worker"]["command"]) == len(hp["worker"]["command"]) + 8
+    for option in ("--speaker-post-adapter", "--speaker-post-dll", "--speaker-post-plan", "--speaker-post-shim"):
+        assert option not in hp["worker"]["command"]
+        assert option in speaker["worker"]["command"]

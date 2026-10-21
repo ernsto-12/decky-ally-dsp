@@ -14,7 +14,7 @@
       "xbox-ally",
       "pipewire"
     ],
-    "description": "Ally DSP with a converted speaker chain or experimental original Dolby headphone Game engine.",
+    "description": "Ally DSP with converted tuning or original Dolby speaker/headphone Game processing.",
     "image": ""
   }
 }

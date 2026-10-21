@@ -6,8 +6,8 @@ Run as the device user, with DSP disabled, after installing this fork:
     --python-dir /ABS/python-embed --proton /ABS/Steam/steamapps/common/Proton/proton
 Use --steam-dir /ABS/Steam if Proton lives outside the Steam directory tree.
 No service starts or routing changes occur. Select the engine in Decky afterwards.
-The private pack must include both headphone and speaker source runtime blobs;
-the runtime selects between them from the active analog output route.
+The private pack must include the headphone spatial settings and the supported
+speaker Game runtime controls; the active analog output route selects the pack.
 """
 import argparse
 import json
@@ -20,7 +20,7 @@ from allydsp.original_assets import AssetError, import_engine
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--source-dir", required=True, type=Path, help="Flat private folder: reviewed two DLLs and four source blobs (headphones + speakers)")
+    parser.add_argument("--source-dir", required=True, type=Path, help="Flat private folder: reviewed DLLs, runtime blobs, speaker post-stage plan and allocator shim")
     parser.add_argument("--python-dir", required=True, type=Path, help="Reviewed Windows x64 embedded Python folder, including LICENSE.txt")
     parser.add_argument("--proton", required=True, type=Path, help="Absolute executable Proton script path")
     parser.add_argument("--steam-dir", type=Path, help="Steam client directory; otherwise derived from Proton path")

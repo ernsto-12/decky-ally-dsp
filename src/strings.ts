@@ -40,7 +40,7 @@ export const t = {
   virtualBass: "Virtual bass (experimental)",
   preGain: "Pre-gain",
   originalOutputBoost: "Output boost",
-  originalOutputBoostDesc: "Adjust original-engine loudness. Higher boost can clip loud scenes.",
+  originalOutputBoostDesc: "Extra gain after Dolby processing (0 dB = profile output). Higher boost can clip loud scenes.",
   originalOutputBoostFailed: "Could not save output boost.",
   reconverting: "Regenerating presets…",
   maintenance: "Maintenance",

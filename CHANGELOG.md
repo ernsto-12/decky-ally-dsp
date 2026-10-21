@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0 (2026-10-21, original-engine fork)
+
+- Apply the supported official Speaker/Game runtime controls, including leveler,
+  DRC, gain controls and EQ/regulator arrays, through the original Dolby receiver.
+- Add the original VLLDP160 speaker post-stage candidate; keep it out of the
+  headphone path. The Windows endpoint's selected version and stage order remain
+  unverified.
+- Verify runtime delivery, level-control state, private asset hashes and both
+  persistent DSP instances. Retain hardware volume control and crash recovery.
+- Require re-importing the matching private pack. Old generations and saved
+  output boost values are preserved. Proprietary assets are excluded.
+
 ## 0.1.10 (2026-10-03)
 
 - Setup and diagnostics pages fit the handheld screen: the setup controls come

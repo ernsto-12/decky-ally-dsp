@@ -24,7 +24,10 @@ VENDOR_PINS = {
     "game-init-source.bin": "b6be9fd91f09bab641f99db05d02b8f19fd93f64e5c0e6c425048c0357c5b168",
     "po-enable-0.bin": "59250bb431a88665fe095477fee0fbea30c928cc038ff34fd83313bd8d0bedd8",
     "headphone-game-output-spatial-rendering.bin": "cdda85711544f2640c674dbae82878f5c83f1441c365f94960f3875220428289",
-    "speaker-game-output-spatial.bin": "0227a54537b0405ca85a8d321dcbb2ffe3fa94be28ddfbfa7c3bc0d46bf97d71",
+    "speaker-game-supported-cp.bin": "88e29379fe4007d623daee006eb9b7e6786db7fb79e49401dfef989b648cfb1a",
+    "DolbyDAXVLLDP160.dll": "28990e8d5845b012020b52947ceab0cf37199ede1e8162cd7d7a03db580af82c",
+    "speaker-game-vlldp-plan.json": "f36a04973a6e373b8ba0cb734c14ac6d2d0d401ffe4347be448091940e3348af",
+    "audioeng.dll": "00d8b24227cb93d7576e3b07da1cdc25b2377e946b7eaa586c98b8d5e0b87a43",
 }
 # Reviewed CPython 3.12 x64 embedded distribution, including its license.
 PYTHON_PINS = {
@@ -67,25 +70,26 @@ PYTHON_PINS = {
 # Updated as a unit with the public original-engine worker bundle.
 PUBLIC_PINS = {
     "frontend_adapter.py": "265d63f39de0b43fdef6096803107599d527b58a63596e861ab63f2ef749e0f3",
-    "hrtf_adapter.py": "3ddf412d6ad731217d326d3350c059ef8487e5cd7f4aa482bde501119989ab19",
+    "hrtf_adapter.py": "24cefd10d90d04d644663d7cc2d7d31eaa627b71af06be63496cd078c7167580",
     "linux_client.py": "4d5a22c6b4892ac0b1b787330548987e91a2f68ff3152e7d859818d1f76bfa62",
     "local_property_store.py": "f5cfc1d90ce8c58ab70bf700a941645bed340ed4f54b31a41d4800473877c0b4",
     "pipewire_bridge.py": "e8179c62b0c0315f4aa196ad39bc2ac1b01a710fb2a4a4034c0e21f364c86472",
     "pipewire_graph.py": "78c77c460ffddaf24a423e220b5c3e4b431a22327ca9d6fcfa513899150ee93e",
     "protocol.py": "d4f6c7e0f48e3ae0396783cd91c6732f23a91966f15358a4713c2a614e76ccc4",
-    "windows_worker.py": "bc7a7b9b32b789a4c5c38e6089f10994c2e41260a1774b05c843721a33a48f09"
+    "vlldp_adapter.py": "e2c6c7c2a8acdcaa87f00598a52635ff786d52944f1858f7e4514ba3b600ee6e",
+    "windows_worker.py": "e91131019bfb372c47c81fb57fd043b4ed22c4195a793aeb987e0d323bb23a30"
 }
 
 LABEL = "Original Dolby / Auto Game"
-SCOPE = ("Official Speaker/Headphone Game spatial configurations; 5.1 PCM → stereo. "
+SCOPE = ("Official Speaker Game runtime controls or Headphone Game spatial configuration; 5.1 PCM → stereo. "
          "The active analog route selects the profile. Device speaker calibration "
          "equivalence and Atmos object metadata are not established.")
 HEADPHONE_LABEL = "Original Dolby / Headphone Game"
 HEADPHONE_SCOPE = ("Official generic headphone Game; 5.1 channel beds → binaural stereo. "
                    "Atmos object metadata is unavailable from PCM.")
 SPEAKER_LABEL = "Original Dolby / Speaker Game"
-SPEAKER_SCOPE = ("Official Speaker Game spatial configuration; 5.1 PCM → stereo. "
-                "Device speaker calibration equivalence and Atmos object metadata are not established.")
+SPEAKER_SCOPE = ("Official Speaker Game controls with an original VLLDP160 speaker post-stage candidate; 5.1 PCM → stereo. "
+                "The live Windows VLLDP version/order, device speaker calibration equivalence and Atmos object metadata are not established.")
 MAX_FILE_BYTES = 64 * 1024 * 1024
 
 
@@ -192,8 +196,8 @@ def import_engine(source_dir: os.PathLike, python_dir: os.PathLike, proton: os.P
                   public_dir: Optional[os.PathLike] = None) -> Dict[str, Any]:
     """Validate local inputs, preserve immutable generations, commit manifest last.
 
-    source_dir is a flat private pack containing the two DLLs and four source
-    blobs named in VENDOR_PINS. python_dir is the matching original Windows
+    source_dir is a flat private pack containing the DLLs, source settings and
+    allocator shim named in VENDOR_PINS. python_dir is the matching Windows
     embedded runtime. Both must already exist; this function never downloads.
     """
     source = _directory(source_dir, "Private source")
@@ -263,9 +267,16 @@ def import_engine(source_dir: os.PathLike, python_dir: os.PathLike, proton: os.P
         }
         speaker_command = list(command)
         speaker_command[speaker_command.index("--engine") + 1] = "hrtf-speakers"
-        speaker_command[speaker_command.index("--runtime-blob") + 1] = _windows_path(target / "original/speaker-game-output-spatial.bin")
+        speaker_command[speaker_command.index("--runtime-blob") + 1] = _windows_path(target / "original/speaker-game-supported-cp.bin")
+        speaker_command.extend([
+            "--speaker-post-adapter", _windows_path(target / "worker/vlldp_adapter.py"),
+            "--speaker-post-dll", _windows_path(target / "original/DolbyDAXVLLDP160.dll"),
+            "--speaker-post-plan", _windows_path(target / "original/speaker-game-vlldp-plan.json"),
+            "--speaker-post-shim", _windows_path(target / "original/audioeng.dll"),
+        ])
         headphone_worker = {"command": command, "cwd": str(target), "environment": dict(environment)}
-        speaker_worker = {"command": speaker_command, "cwd": str(target), "environment": dict(environment)}
+        speaker_environment = dict(environment, WINEDLLOVERRIDES=environment["WINEDLLOVERRIDES"] + ";audioeng=n")
+        speaker_worker = {"command": speaker_command, "cwd": str(target), "environment": speaker_environment}
         profiles = {
             "headphones": {"label": HEADPHONE_LABEL, "scope": HEADPHONE_SCOPE,
                            "profile": "game", "voicing": "official-headphones", "worker": headphone_worker},
