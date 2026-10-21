@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.1 (2026-10-21, original-engine fork)
+## 0.3.1 (2026-10-22, original-engine fork)
 
 - Recover the desired ON state after suspend/resume or an original-engine
   failure. Check the current daemon, heartbeat, output identity and exact channel
@@ -10,6 +10,11 @@
   retain the latest selection and handle errors without disabling the slider.
 - Preserve cancellation during recovery and volume-sync shutdown, including
   failures in an already-running routing operation.
+- Shorten shutdown by draining only the validated private Dolby Proton prefix;
+  immediately clean residual processes in the service's own cgroup. Keep the
+  bounded systemd helper timeout and route restoration.
+- Detect resume with a lightweight clock check every 250 ms while retaining the
+  normal three-second interval for full audio health checks.
 
 ## 0.3.0 (2026-10-21, original-engine fork)
 

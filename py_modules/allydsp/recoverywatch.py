@@ -27,14 +27,18 @@ def suspend_elapsed() -> float:
 class RecoveryWatcher:
     def __init__(self, on_check: Callable[[bool], Awaitable[bool]], *,
                  interval: float = 3.0, retry_initial: float = 3.0,
-                 retry_max: float = 30.0, clock=time.monotonic,
+                 retry_max: float = 30.0, tick_interval: float = 0.25, clock=time.monotonic,
                  suspend_clock=suspend_elapsed):
-        if not 0 < interval or not 0 < retry_initial <= retry_max:
+        values = (interval, retry_initial, retry_max, tick_interval)
+        if (any(isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value <= 0 for value in values)
+                or retry_initial > retry_max):
             raise ValueError("Recovery intervals must be positive")
         self.on_check = on_check
         self.interval = interval
         self.retry_initial = retry_initial
         self.retry_max = retry_max
+        self.tick_interval = tick_interval
         self.clock = clock
         self.suspend_clock = suspend_clock
         self._suspend_total = suspend_clock()
@@ -51,14 +55,20 @@ class RecoveryWatcher:
         if self._task is not None and not self._task.done():
             self._task.cancel()
 
-    async def poll(self) -> bool:
+    def _observe_resume(self) -> bool:
         total = self.suspend_clock()
+        resumed = False
         if math.isfinite(total):
             if math.isfinite(self._suspend_total) and total - self._suspend_total > 1.0:
+                resumed = True
                 self._resume_pending = True
                 self._retry_at = 0.0
                 self._failures = 0
             self._suspend_total = total
+        return resumed
+
+    async def poll(self) -> bool:
+        self._observe_resume()
         now = self.clock()
         if now < self._retry_at:
             return False
@@ -80,6 +90,12 @@ class RecoveryWatcher:
         return healthy
 
     async def run(self) -> None:
+        next_check = self.clock()
         while True:
-            await self.poll()
-            await asyncio.sleep(self.interval)
+            resumed = self._observe_resume()
+            if resumed or self.clock() >= next_check:
+                await self.poll()
+                next_check = self.clock() + self.interval
+            # Only the cheap BOOTTIME/MONOTONIC comparison runs at this rate.
+            # PipeWire/service probes retain their normal interval and backoff.
+            await asyncio.sleep(min(self.tick_interval, max(0.0, next_check - self.clock())))

@@ -193,3 +193,79 @@ def test_start_is_idempotent_and_cancel_stops_owned_loop():
         assert owned.done() and len(calls) == count
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), True, None, "0.25"])
+def test_tick_interval_must_be_a_finite_positive_number(value):
+    async def check(_):
+        return True
+    with pytest.raises(ValueError, match="intervals"):
+        watcher_for(check, Clocks(), tick_interval=value)
+
+
+async def drive_loop(watcher, clocks, monkeypatch, *, until, on_tick=None):
+    """Advance virtual lightweight ticks without real waits or process probes."""
+    async def sleep(delay):
+        assert 0 < delay <= watcher.tick_interval
+        clocks.advance(delay)
+        if on_tick:
+            on_tick()
+        if clocks.now >= until:
+            raise asyncio.CancelledError()
+    monkeypatch.setattr(recoverywatch.asyncio, "sleep", sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await watcher.run()
+
+
+def test_lightweight_ticks_do_not_run_full_health_checks_four_times_per_second(monkeypatch):
+    async def scenario():
+        clocks, calls = Clocks(), []
+        async def check(resumed):
+            calls.append((clocks.now, resumed))
+            return True
+        watcher = watcher_for(check, clocks)
+        await drive_loop(watcher, clocks, monkeypatch, until=10)
+        assert calls == [(0, False), (3, False), (6, False), (9, False)]
+    asyncio.run(scenario())
+
+
+def test_resume_is_checked_on_next_lightweight_tick_before_full_health_deadline(monkeypatch):
+    async def scenario():
+        clocks, calls = Clocks(), []
+        async def check(resumed):
+            calls.append((clocks.now, resumed))
+            return True
+        def tick():
+            if clocks.now == .5:
+                clocks.suspended += 120
+        watcher = watcher_for(check, clocks)
+        await drive_loop(watcher, clocks, monkeypatch, until=4, on_tick=tick)
+        assert calls == [(0, False), (.5, True), (3.5, False)]
+    asyncio.run(scenario())
+
+
+def test_pending_resume_does_not_bypass_backoff_on_every_lightweight_tick(monkeypatch):
+    async def scenario():
+        clocks, calls = Clocks(), []
+        async def check(resumed):
+            calls.append((clocks.now, resumed))
+            return False
+        def tick():
+            if clocks.now == .5:
+                clocks.suspended += 120
+        watcher = watcher_for(check, clocks, retry_initial=3, retry_max=12)
+        await drive_loop(watcher, clocks, monkeypatch, until=11, on_tick=tick)
+        assert calls == [(0, False), (.5, True), (3.5, True), (9.5, True)]
+    asyncio.run(scenario())
+
+
+def test_shorter_health_interval_is_respected_even_with_default_lightweight_tick(monkeypatch):
+    async def scenario():
+        clocks, calls = Clocks(), []
+        async def check(resumed):
+            calls.append(clocks.now)
+            return True
+        watcher = watcher_for(check, clocks, interval=.125)
+        await drive_loop(watcher, clocks, monkeypatch, until=.5)
+        assert calls == [0, .125, .25, .375]
+    asyncio.run(scenario())

@@ -125,14 +125,17 @@ def unit_text() -> str:
     python = _unit_arg(paths.SYSTEM_PYTHON)
     recovery = _recovery_script()
     environment = ["Environment=" + _unit_arg(key + "=" + value) for key, value in _path_environment().items()]
+    # ExecStop gives the validated bridge/private prefix a bounded graceful
+    # shutdown. Kill only residual processes in this unit's cgroup immediately
+    # afterward, including when the bridge has already crashed.
     return "\n".join([
         "[Unit]", "Description=Ally DSP original Dolby audio engine", "After=pipewire.service pipewire-pulse.service",
         "BindsTo=pipewire.service", "ConditionPathExists=" + ENGINE_FILE.replace("%", "%%"), "", "[Service]",
         "Type=simple", *environment,
         "ExecStart=" + python + " " + _unit_arg(script) + " --config " + _unit_arg(RUNTIME_FILE),
-        "ExecStop=" + python + " " + _unit_arg(recovery),
+        "ExecStop=" + python + " " + _unit_arg(recovery) + " --action stop",
         "ExecStopPost=" + python + " " + _unit_arg(recovery),
-        "Restart=no", "KillMode=control-group", "TimeoutStopSec=12", "", "[Install]", "WantedBy=default.target", ""])
+        "Restart=no", "KillMode=control-group", "KillSignal=SIGKILL", "TimeoutStopSec=12", "", "[Install]", "WantedBy=default.target", ""])
 
 
 def _path_environment():
@@ -180,6 +183,12 @@ def _routing_action(action):
                  env=user_env(_path_environment()))
     if not result.ok:
         raise RuntimeError(result.err.strip() or "Original audio routing recovery failed")
+
+
+def _stop_original_locked():
+    # This helper is copied beside the recovery entry point for uninstall too.
+    from .original_stop import stop_locked
+    return stop_locked()
 
 
 def unit_installed() -> bool:
