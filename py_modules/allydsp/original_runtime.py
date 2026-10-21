@@ -391,9 +391,101 @@ def _restore_physical_master(journal, owned):
         write_json(ROUTING_FILE, journal)
 
 
+def _mirror_sinks(journal):
+    mirror = journal.get("master_mirror")
+    if not isinstance(mirror, dict) or mirror.get("schema") != "ally-dsp-original-physical-master-v1":
+        raise RuntimeError("Unknown original physical-master journal")
+    sinks = _sinks()
+    owned = next((sink for sink in sinks if sink.get("name") == CAPTURE_SINK), None)
+    physical = next((sink for sink in sinks if sink.get("name") == journal["physical_sink"]), None)
+    if not _owns_sink(owned, journal) or not _same_physical(physical, mirror):
+        raise RuntimeError("Audio output ownership changed during master synchronization")
+    return physical, owned
+
+
+def _mirror_levels(sink, virtual=False):
+    channels = (*_STEREO_CHANNELS, "front-center", "lfe", "rear-left", "rear-right") if virtual else _STEREO_CHANNELS
+    return {"volume": _sink_volume(sink, channels), "mute": _sink_mute(sink)}
+
+
+def _write_mirror_control(journal, target, control, value):
+    physical, owned = _mirror_sinks(journal)
+    sink = physical if target == "physical" else owned
+    journal["master_mirror"]["intent"] = {"control": control, "target": target, "value": value}
+    write_json(ROUTING_FILE, journal)
+    args = (["pactl", "set-sink-volume", sink["name"], *map(str, value)] if control == "volume"
+            else ["pactl", "set-sink-mute", sink["name"], "1" if value else "0"])
+    _checked(args)
+    current_physical, current_owned = _mirror_sinks(journal)
+    observed = _mirror_levels(current_physical if target == "physical" else current_owned, virtual=target == "virtual")
+    if target == "virtual":
+        matches = (all(abs(actual - expected) <= 4 for actual, expected in zip(observed[control], value))
+                   if control == "volume" else observed[control] == value)
+        if not matches:
+            # Do not commit an intervening UI change as though it were our
+            # paired write; the next sync must still observe that new input.
+            raise RuntimeError("The virtual master changed while synchronization was being applied")
+    return observed
+
+
+def _mirror_master(journal, physical_only=False):
+    mirror = journal["master_mirror"]
+    for control in ("volume", "mute"):
+        physical, owned = _mirror_sinks(journal)
+        physical_levels, virtual_levels = _mirror_levels(physical), _mirror_levels(owned, virtual=True)
+        p_value, v_value = physical_levels[control], virtual_levels[control]
+        physical_changed = p_value != mirror["last_physical"][control]
+        virtual_changed = v_value != mirror["last_virtual"][control]
+        pending = mirror.get("intent")
+        if (not physical_only and not physical_changed and not virtual_changed
+                and (pending is None or pending.get("control") != control)):
+            continue  # Readback rounding is a stable baseline, not a new input.
+        # Hardware volume keys may address the physical sink even while the
+        # virtual sink is the default. Physical wins a simultaneous conflict.
+        from_virtual = not physical_only and virtual_changed and not physical_changed
+        source = "virtual" if from_virtual else "physical"
+        if from_virtual:
+            desired = v_value[:2] if control == "volume" else v_value
+            if desired != p_value:
+                p_value = _write_mirror_control(journal, "physical", control, desired)[control]
+        desired_virtual = _surround_volume(p_value) if control == "volume" else p_value
+        if v_value != desired_virtual:
+            v_value = _write_mirror_control(journal, "virtual", control, desired_virtual)[control]
+        pending = mirror.get("intent")
+        if (p_value == mirror["last_physical"][control] and v_value == mirror["last_virtual"][control]
+                and (pending is None or pending.get("control") != control)):
+            continue  # Stable polling does not rewrite the recovery journal.
+        # Commit only the paired values used above. A physical change during a
+        # later control's update remains different and is seen on the next sync.
+        mirror["last_physical"][control] = p_value
+        mirror["last_virtual"][control] = v_value
+        mirror.update(intent=None, last_direction=source, last_sync_unix_seconds=time.time())
+        write_json(ROUTING_FILE, journal)
+
+
+def sync_master():
+    """Synchronize controls through the system-Python routing lock."""
+    journal = read_json(ROUTING_FILE)
+    if (not isinstance(journal, dict) or journal.get("schema") != "ally-dsp-original-routing-v2"
+            or not journal.get("routed") or journal.get("restored") or not verify(0)):
+        return False
+    _routing_action("sync")
+    return True
+
+
+def _sync_master_locked():
+    journal = read_json(ROUTING_FILE)
+    if (not isinstance(journal, dict) or journal.get("schema") != "ally-dsp-original-routing-v2"
+            or not journal.get("routed") or journal.get("restored")):
+        return False
+    _mirror_master(journal)
+    return True
+
+
 def _restore_routing_locked() -> None:
     journal = read_json(ROUTING_FILE)
-    if not isinstance(journal, dict) or journal.get("schema") != "ally-dsp-original-routing-v1" or journal.get("restored"):
+    if (not isinstance(journal, dict) or journal.get("schema") not in
+            ("ally-dsp-original-routing-v1", "ally-dsp-original-routing-v2") or journal.get("restored")):
         return
     sinks = _sinks()
     names = {s["name"] for s in sinks}
@@ -408,7 +500,17 @@ def _restore_routing_locked() -> None:
         raise RuntimeError("The previous output is unavailable; routing recovery is pending")
     # Restore the audible master before any application can reach the physical
     # output directly again. Volume and mute each respect external changes.
-    _restore_physical_master(journal, owned)
+    if journal["schema"] == "ally-dsp-original-routing-v2":
+        if owned and journal.get("routed"):
+            try:
+                _mirror_master(journal)
+            except Exception as error:
+                # A missing output must not strand game routes. v2 never owns
+                # unity or restores an old level: retain the current master.
+                journal["master_sync_recovery_error"] = str(error)
+                write_json(ROUTING_FILE, journal)
+    else:
+        _restore_physical_master(journal, owned)
     if current_default == CAPTURE_SINK:
         _checked(["pactl", "set-default-sink", destination])
     original_routes = {str(s["index"]): s for s in journal.get("moved", [])}
@@ -444,7 +546,11 @@ def _route_after_ready_locked():
     if not verify(0):
         raise RuntimeError("The original worker exited before routing was applied")
     apply_output_gain()
-    _sync_virtual_master(journal, "ready")
+    if journal.get("schema") == "ally-dsp-original-routing-v2":
+        if not journal.get("routed"):
+            _mirror_master(journal, physical_only=True)
+    else:
+        _sync_virtual_master(journal, "ready")
     for stream in _inputs():
         if stream.get("sink") != physical["index"]:
             continue
@@ -458,7 +564,8 @@ def _route_after_ready_locked():
         if not result.ok and any(s.get("index") == stream["index"] for s in _inputs()):
             raise RuntimeError(result.err.strip() or "Could not route an active audio stream")
     _checked(["pactl", "set-default-sink", CAPTURE_SINK])
-    _handoff_physical_master(journal)
+    if journal.get("schema") != "ally-dsp-original-routing-v2":
+        _handoff_physical_master(journal)
     journal["routed"] = True
     write_json(ROUTING_FILE, journal)
 
@@ -480,24 +587,22 @@ def _prepare_route_locked():
     if previous == CAPTURE_SINK:
         raise RuntimeError("A previous original-engine route needs recovery")
     os.makedirs(ORIGINAL_DIR, exist_ok=True)
-    journal = {"schema": "ally-dsp-original-routing-v1", "previous_default": previous,
+    journal = {"schema": "ally-dsp-original-routing-v2", "previous_default": previous,
                "physical_sink": target["name"], "module_id": None, "moved": [], "restored": False,
                "token": uuid.uuid4().hex,
-               "volume_handoff": {"schema": "ally-dsp-original-volume-handoff-v1",
+               "master_mirror": {"schema": "ally-dsp-original-physical-master-v1",
                    "physical_identity": _physical_identity(physical),
-                   "original": {"volume": volume, "mute": mute},
-                   "virtual_initial": {"volume": virtual_volume, "mute": mute},
-                   "volume": {"intent": False, "applied": False},
-                   "mute": {"intent": False, "applied": False}}}
+                   "last_physical": {"volume": volume, "mute": mute},
+                   "last_virtual": {"volume": virtual_volume, "mute": mute}, "intent": None}}
     write_json(ROUTING_FILE, journal)
     module = _checked(["pactl", "load-module", "module-null-sink", "sink_name=" + CAPTURE_SINK,
                            "rate=48000", "channels=6", "channel_map=front-left,front-right,front-center,lfe,rear-left,rear-right",
-                           'sink_properties="device.description=AllyDSPOriginal node.virtual=true priority.session=0 channelmix.upmix=false allydsp.session=' + journal["token"] + '"'])
+                           'sink_properties="device.description=AllyDSPOriginal node.virtual=true priority.session=0 channelmix.upmix=false monitor.channel-volumes=false allydsp.session=' + journal["token"] + '"'])
     if not module.isdigit():
         raise RuntimeError("PipeWire returned an invalid sink module identifier")
     journal["module_id"] = int(module)
     write_json(ROUTING_FILE, journal)
-    _sync_virtual_master(journal, "prepare")
+    _mirror_master(journal, physical_only=True)
 
 
 def start() -> bool:

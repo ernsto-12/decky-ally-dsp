@@ -14,6 +14,7 @@ sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), "py_mo
 from allydsp import asus_fetch, convert, deckyfix, diagnostics, dsp_runtime, hardware, original_runtime, paths, settings, setup_flow, updater  # noqa: E402
 from allydsp.constants import PROFILES, VOICING_LABELS, VOICINGS  # noqa: E402
 from allydsp.jackwatch import JackWatcher  # noqa: E402
+from allydsp.masterwatch import MasterWatcher  # noqa: E402
 
 
 class Plugin:
@@ -35,12 +36,17 @@ class Plugin:
         self.lv2_cache: Optional[Dict[str, Any]] = None
         self.jack = JackWatcher(on_change=self._on_jack_change, lifecycle_lock=self.engine_lock)
         self.jack.start(self._should_run)
+        self.master = MasterWatcher(on_change=self._sync_original_master)
+        self.master.start()
         self.loop.create_task(self._startup())
         decky.logger.info("Ally DSP backend started (plugin dir %s)", paths.PLUGIN_DIR)
 
     # _unload and _uninstall do not await: if deckyfix could not stop Decky's socket loop from
     # spinning, the event loop never runs again once the stop begins.
     async def _unload(self):
+        master = getattr(self, "master", None)
+        if master:
+            master.cancel()
         for t in (getattr(self.jack, "_task", None), self.setup_task, self.convert_task, self.update_task):
             if t and not t.done():
                 t.cancel()
@@ -114,6 +120,24 @@ class Plugin:
         if dsp_runtime.engine_kind() == "original" and self._should_run():
             await self._apply_current_locked()
         await decky.emit("dsp_state", await self._dsp_state())
+
+    async def _sync_original_master(self) -> None:
+        async with self.engine_lock:
+            if dsp_runtime.engine_kind() != "original" or not self.settings.get("enabled"):
+                return
+            # Cancelling a to_thread await does not stop its thread. Keep the
+            # lifecycle lock until that bounded routing operation has finished.
+            operation = asyncio.create_task(asyncio.to_thread(original_runtime.sync_master))
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                while not operation.done():
+                    try:
+                        await asyncio.shield(operation)
+                    except asyncio.CancelledError:
+                        continue
+                operation.result()
+                raise
 
     async def _dsp_state(self) -> Dict[str, Any]:
         st = await asyncio.to_thread(dsp_runtime.status, False)

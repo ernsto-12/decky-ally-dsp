@@ -9,11 +9,12 @@ from allydsp import original_runtime as runtime
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--action", choices=("restore", "prepare", "route"), default="restore")
+    parser.add_argument("--action", choices=("restore", "prepare", "route", "sync"), default="restore")
     args = parser.parse_args()
     os.makedirs(runtime.ORIGINAL_DIR, exist_ok=True)
     with open(os.path.join(runtime.ORIGINAL_DIR, "routing.lock"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         {"restore": runtime._restore_routing_locked,
          "prepare": runtime._prepare_route_locked,
-         "route": runtime._route_after_ready_locked}[args.action]()
+         "route": runtime._route_after_ready_locked,
+         "sync": runtime._sync_master_locked}[args.action]()

@@ -14,7 +14,7 @@ Original assets are imported locally with `scripts/import-original-engine.py --h
 
 **Output boost** is an original-engine-only manual control: **0–12 dB** in **0.5 dB** steps, default **0 dB**. It adjusts the plugin's playback stream, independently of the converted engine's pre-gain, and does not change the DLL's PCM processing. It provides no automatic loudness compensation. Higher boost can clip loud scenes.
 
-While the original engine is active, volume keys control the virtual input as the single master. The physical output is temporarily held at 100% (unity) to avoid double attenuation. Stopping the original engine transfers the current master volume back to the physical output.
+While the original engine is active, the physical output remains the volume and mute master, so the handheld's volume keys act directly on the speakers. The virtual input displays the same controls and changes there are mirrored back to the physical output. Its monitor passes unattenuated PCM to the DLL to avoid double attenuation. Decky observes sink changes to keep the controls in sync; the physical volume keys continue working if Decky stops.
 
 The remainder describes the upstream converted engine.
 
