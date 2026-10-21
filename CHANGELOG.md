@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.1 (2026-10-21, original-engine fork)
+
+- Recover the desired ON state after suspend/resume or an original-engine
+  failure. Check the current daemon, heartbeat, output identity and exact channel
+  routes; wait with bounded retries while the audio session returns. Preserve
+  OFF, external output selection, hardware volume/mute and saved output boost.
+- Keep controller focus on Output boost while saving. Serialize rapid changes,
+  retain the latest selection and handle errors without disabling the slider.
+- Preserve cancellation during recovery and volume-sync shutdown, including
+  failures in an already-running routing operation.
+
 ## 0.3.0 (2026-10-21, original-engine fork)
 
 - Apply the supported official Speaker/Game runtime controls, including leveler,

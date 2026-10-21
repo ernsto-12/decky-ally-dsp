@@ -27,6 +27,8 @@ CAPTURE_SINK = "ally_dsp_original_input"
 NAMESPACE = "ally_dsp_original"
 POSITIONS = ["FL", "FR", "FC", "LFE", "RL", "RR"]
 _hash_cache = {}
+HEALTH_TIMEOUT_SECONDS = 3
+HEARTBEAT_MAX_AGE_SECONDS = 8
 
 
 def _json_command(args):
@@ -650,6 +652,145 @@ def verify(timeout: float = 4.0) -> bool:
         time.sleep(0.2)
 
 
+def _health_dump():
+    result = run(["pw-dump"], timeout=HEALTH_TIMEOUT_SECONDS)
+    if not result.ok:
+        return []
+    try:
+        dump = json.loads(result.out)
+        return dump if isinstance(dump, list) else []
+    except ValueError:
+        return []
+
+
+def _route_health(dump, physical_name):
+    """Inspect current registry objects, not the bridge's earlier READY audit."""
+    node_type, port_type, link_type = ("PipeWire:Interface:" + x for x in ("Node", "Port", "Link"))
+    nodes = {str(x.get("id")): x for x in dump if x.get("type") == node_type}
+    ports = {str(x.get("id")): x for x in dump if x.get("type") == port_type}
+    expected_names = (CAPTURE_SINK, NAMESPACE + ".capture", NAMESPACE + ".playback", physical_name)
+    selected = {}
+    for name in expected_names:
+        matches = [x for x in nodes.values() if x.get("info", {}).get("props", {}).get("node.name") == name]
+        if len(matches) != 1:
+            return "missing-or-duplicate-node", {"input": 0, "output": 0}
+        selected[name] = matches[0]
+        info = matches[0].get("info", {})
+        if info.get("error") or info.get("state") == "error":
+            return "failed-audio-node", {"input": 0, "output": 0}
+        if info.get("props", {}).get("object.serial") is None:
+            return "missing-node-identity", {"input": 0, "output": 0}
+    bridge_ids = {str(selected[name]["id"]) for name in expected_names[1:3]}
+    expected = {(CAPTURE_SINK, NAMESPACE + ".capture", channel) for channel in POSITIONS}
+    expected.update((NAMESPACE + ".playback", physical_name, channel) for channel in ("FL", "FR"))
+    seen, counts = set(), {"input": 0, "output": 0}
+    for item in dump:
+        if item.get("type") != link_type:
+            continue
+        info = item.get("info", {})
+        if not any(str(info.get(side + "-node-id")) in bridge_ids for side in ("input", "output")):
+            continue
+        if info.get("error") or info.get("state") not in ("active", "paused"):
+            return "inactive-or-failed-link", counts
+        endpoints = []
+        for side in ("output", "input"):
+            node_id, port_id = str(info.get(side + "-node-id")), str(info.get(side + "-port-id"))
+            node, port = nodes.get(node_id), ports.get(port_id)
+            if node is None or port is None:
+                return "missing-link-endpoint", counts
+            port_info, props = port.get("info", {}), port.get("info", {}).get("props", {})
+            if (str(props.get("node.id")) != node_id or port_info.get("direction") != side
+                    or props.get("object.serial") is None):
+                return "invalid-port-identity", counts
+            endpoints.append((node.get("info", {}).get("props", {}).get("node.name"), props.get("audio.channel")))
+        (output_name, output_channel), (input_name, input_channel) = endpoints
+        route = (output_name, input_name, output_channel)
+        if output_channel != input_channel or route not in expected:
+            return "unexpected-channel-route", counts
+        if route in seen:
+            return "duplicate-channel-route", counts
+        seen.add(route)
+        counts["input" if input_name == NAMESPACE + ".capture" else "output"] += 1
+    return (None if seen == expected else "incomplete-channel-routes"), counts
+
+
+def _health_snapshot(dump, state):
+    def result(healthy, available, reason, links=None):
+        return {"healthy": healthy, "available": available, "reason": reason,
+                "links": links or {"input": 0, "output": 0}}
+    if not dump:
+        return result(False, False, "pipewire-unavailable")
+    target = hardware.find_speaker_sink(dump)
+    if not target:
+        return result(False, False, "physical-output-unavailable")
+    default = run(["pactl", "get-default-sink"], timeout=HEALTH_TIMEOUT_SECONDS)
+    if not default.ok or not default.out.strip():
+        return result(False, False, "audio-session-unavailable")
+    # An explicitly selected HDMI/USB/Bluetooth output is not a resume failure.
+    # Recovery must not take the user's new output back to the analog speakers.
+    if default.out.strip() not in (CAPTURE_SINK, target["name"]):
+        return result(False, False, "external-output-selected")
+    service = converted_runtime.systemctl("show", "--property=ActiveState", "--property=MainPID",
+                                          paths.UNIT_NAME, timeout=HEALTH_TIMEOUT_SECONDS)
+    properties = dict(line.split("=", 1) for line in service.out.splitlines() if "=" in line)
+    if not service.ok or properties.get("ActiveState") != "active":
+        return result(False, True, "service-inactive")
+    pid = state.get("daemon_pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 or properties.get("MainPID") != str(pid):
+        return result(False, True, "daemon-identity-mismatch")
+    if not state.get("ready") or state.get("state") not in ("ready", "running") or state.get("last_error"):
+        return result(False, True, "worker-not-ready")
+    updated = state.get("updated_unix_seconds")
+    if (isinstance(updated, bool) or not isinstance(updated, (int, float)) or not math.isfinite(updated)
+            or not -2 <= time.time() - updated <= HEARTBEAT_MAX_AGE_SECONDS):
+        return result(False, True, "stale-worker-heartbeat")
+    journal = read_json(ROUTING_FILE, {}) or {}
+    if journal.get("restored") or not journal.get("routed") or journal.get("physical_sink") != target["name"]:
+        return result(False, True, "routing-not-applied")
+    # ALSA node names survive device recreation; registry serials do not. A
+    # complete set of new links must not reuse the old session's volume journal.
+    ownership = {"ally-dsp-original-routing-v2": ("master_mirror", "ally-dsp-original-physical-master-v1"),
+                 "ally-dsp-original-routing-v1": ("volume_handoff", "ally-dsp-original-volume-handoff-v1")}
+    owner_key, owner_schema = ownership.get(journal.get("schema"), (None, None))
+    owner = journal.get(owner_key)
+    identity = (owner.get("physical_identity")
+                if isinstance(owner, dict) and owner.get("schema") == owner_schema else None)
+    serial = identity.get("serial") if isinstance(identity, dict) else None
+    if (not isinstance(identity, dict) or identity.get("name") != target["name"]
+            or isinstance(serial, bool) or not isinstance(serial, (str, int)) or not str(serial)):
+        return result(False, False, "routing-identity-unavailable")
+    physical = next((x for x in dump if x.get("type") == "PipeWire:Interface:Node"
+                     and x.get("id") == target["id"]), {})
+    current_serial = physical.get("info", {}).get("props", {}).get("object.serial")
+    if current_serial is None:
+        return result(False, False, "physical-identity-unavailable")
+    if str(current_serial) != str(serial):
+        return result(False, True, "physical-output-recreated")
+    if (state.get("capture_sink") != CAPTURE_SINK or state.get("playback_sink") != target["name"]
+            or not state.get("node_routes_verified")):
+        return result(False, True, "worker-route-mismatch")
+    owned = [x for x in dump if x.get("type") == "PipeWire:Interface:Node"
+             and x.get("info", {}).get("props", {}).get("node.name") == CAPTURE_SINK]
+    if not owned:
+        return result(False, True, "capture-sink-unavailable")
+    if len(owned) != 1 or not journal.get("token") or owned[0].get("info", {}).get("props", {}).get("allydsp.session") != journal["token"]:
+        return result(False, False, "capture-sink-ownership-changed")
+    if default.out.strip() != CAPTURE_SINK:
+        return result(False, True, "default-bypasses-original")
+    reason, links = _route_health(dump, target["name"])
+    return result(reason is None, True, reason or "ready", links)
+
+
+def health() -> Dict[str, Any]:
+    """Bounded, read-only liveness and channel-route check for session recovery.
+
+    ``available`` describes whether analog recovery can currently be attempted;
+    ``healthy`` also requires this daemon's fresh heartbeat and complete routes.
+    No service, default output, journal, volume or mute state is changed here.
+    """
+    return _health_snapshot(_health_dump(), read_json(STATUS_FILE, {}) or {})
+
+
 def active_meta():
     return read_json(META_FILE)
 
@@ -713,7 +854,7 @@ def apply_preset(profile: str, voicing: str, pregain_db: float = 0.0, restart_un
 
 def status(with_journal: bool = True) -> Dict[str, Any]:
     state = read_json(STATUS_FILE, {}) or {}
-    dump = hardware.pw_dump()
+    dump = _health_dump()
     names = {item.get("id"): item.get("info", {}).get("props", {}).get("node.name")
              for item in dump if item.get("type") == "PipeWire:Interface:Node"}
     links = {"input": 0, "output": 0}
@@ -725,7 +866,9 @@ def status(with_journal: bool = True) -> Dict[str, Any]:
             links["input"] += 1
         if names.get(info.get("output-node-id")) == NAMESPACE + ".playback":
             links["output"] += 1
+    current_health = _health_snapshot(dump, state)
     return {"unit_installed": os.path.isfile(paths.UNIT_PATH), "unit_current": unit_installed(),
             "enabled": converted_runtime.is_enabled(), "active": converted_runtime.is_active(),
-            "verified": verify(0), "links": links, "active_preset": active_meta(),
+            "verified": current_health["healthy"], "health": current_health,
+            "links": links, "active_preset": active_meta(),
             "journal": converted_runtime.journal(12) if with_journal else "", "original": state}

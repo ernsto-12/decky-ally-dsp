@@ -15,6 +15,7 @@ from allydsp import asus_fetch, convert, deckyfix, diagnostics, dsp_runtime, har
 from allydsp.constants import PROFILES, VOICING_LABELS, VOICINGS  # noqa: E402
 from allydsp.jackwatch import JackWatcher  # noqa: E402
 from allydsp.masterwatch import MasterWatcher  # noqa: E402
+from allydsp.recoverywatch import RecoveryWatcher  # noqa: E402
 
 
 class Plugin:
@@ -34,10 +35,13 @@ class Plugin:
         self.convert_last: Optional[Dict[str, Any]] = None
         self.update_task: Optional[asyncio.Task] = None
         self.lv2_cache: Optional[Dict[str, Any]] = None
+        self._recovery_ready = False
         self.jack = JackWatcher(on_change=self._on_jack_change, lifecycle_lock=self.engine_lock)
         self.jack.start(self._should_run)
         self.master = MasterWatcher(on_change=self._sync_original_master)
         self.master.start()
+        self.recovery = RecoveryWatcher(self._recover_audio)
+        self.recovery.start()
         self.loop.create_task(self._startup())
         decky.logger.info("Ally DSP backend started (plugin dir %s)", paths.PLUGIN_DIR)
 
@@ -47,6 +51,9 @@ class Plugin:
         master = getattr(self, "master", None)
         if master:
             master.cancel()
+        recovery = getattr(self, "recovery", None)
+        if recovery:
+            recovery.cancel()
         for t in (getattr(self.jack, "_task", None), self.setup_task, self.convert_task, self.update_task):
             if t and not t.done():
                 t.cancel()
@@ -68,10 +75,13 @@ class Plugin:
             updater.remove_legacy_marker()
             if self.settings["setup"].get("done") or dsp_runtime.engine_kind() == "original":
                 await self._reconcile()
+            self._recovery_ready = True
             if self.settings["update"].get("autoCheck", True):
                 await self.check_for_update(False)
         except Exception as e:
             decky.logger.error("startup reconcile failed: %s", e)
+        finally:
+            self._recovery_ready = True
 
     async def _reconcile(self) -> None:
         """Bring unit and active preset back after an update or lost data."""
@@ -130,20 +140,82 @@ class Plugin:
             operation = asyncio.create_task(asyncio.to_thread(original_runtime.sync_master))
             try:
                 await asyncio.shield(operation)
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as cancellation:
                 while not operation.done():
                     try:
                         await asyncio.shield(operation)
                     except asyncio.CancelledError:
                         continue
-                operation.result()
-                raise
+                    except Exception:
+                        break
+                try:
+                    operation.result()
+                except (Exception, asyncio.CancelledError) as error:
+                    decky.logger.warning("master sync finished with an error during unload: %s", error)
+                raise cancellation
 
     async def _dsp_state(self) -> Dict[str, Any]:
         st = await asyncio.to_thread(dsp_runtime.status, False)
         st["jack"] = self.jack.state()
         st["enabled_setting"] = bool(self.settings.get("enabled"))
         return st
+
+    async def _recover_audio(self, resumed: bool = False) -> bool:
+        """Recover desired ON state without changing user controls or routing OFF."""
+        async with self.engine_lock:
+            if not getattr(self, "_recovery_ready", True):
+                return False
+            if not self._should_run():
+                return True
+            if self._setup_running() or (self.convert_task and not self.convert_task.done()):
+                return False
+            kind = dsp_runtime.engine_kind()
+            if kind == "converted":
+                if self.jack.paused:
+                    return True
+                healthy = await asyncio.to_thread(dsp_runtime.is_active)
+                available = bool(await asyncio.to_thread(hardware.pw_dump))
+                reason = "active" if healthy else "inactive"
+            else:
+                health = await asyncio.to_thread(original_runtime.health)
+                healthy, available = health["healthy"], health["available"]
+                reason = health["reason"]
+            if healthy and not resumed:
+                self._recovery_last = None
+                return True
+            signature = (kind, reason, available, resumed)
+            if signature != getattr(self, "_recovery_last", None):
+                self._recovery_last = signature
+                await decky.emit("dsp_state", await self._dsp_state())
+            if not available:
+                return False
+            decky.logger.info("rebuilding %s audio after %s", kind,
+                              "suspend/resume" if resumed else reason)
+            # A cancelled to_thread await leaves its mutator running. Shield the
+            # whole apply so engine_lock is held until all routing work finishes.
+            operation = asyncio.create_task(self._apply_current_locked(force_restart=True))
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError as cancellation:
+                while not operation.done():
+                    try:
+                        await asyncio.shield(operation)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                try:
+                    operation.result()
+                except (Exception, asyncio.CancelledError) as error:
+                    decky.logger.warning("audio recovery finished with an error during unload: %s", error)
+                raise cancellation
+            except Exception:
+                await decky.emit("dsp_state", await self._dsp_state())
+                raise
+            self._recovery_last = None
+            if kind == "original":
+                return bool((await asyncio.to_thread(original_runtime.health))["healthy"])
+            return bool(await asyncio.to_thread(dsp_runtime.is_active))
 
     def _save(self) -> None:
         # setup_flow writes "setup" from its worker thread; never overwrite it with this copy.
@@ -158,6 +230,9 @@ class Plugin:
         res = settings.resolve(self.settings, self.running_app)
         if dsp_runtime.engine_kind() == "original":
             want_running = self._should_run()
+            if force_restart:
+                if not await asyncio.to_thread(dsp_runtime.stop):
+                    raise RuntimeError("Could not stop the original engine for recovery")
             result = await asyncio.to_thread(dsp_runtime.apply_preset, res["profile"], res["voicing"], 0.0, want_running)
             if not want_running and await asyncio.to_thread(dsp_runtime.is_active):
                 await asyncio.to_thread(dsp_runtime.stop)

@@ -24,6 +24,7 @@ import {
   setPerApp,
 } from "../backend";
 import { usePluginState } from "../hooks/usePluginState";
+import { DebouncedValueWriter } from "../hooks/debouncedValueWriter";
 import { setupIntent } from "../setupIntent";
 import { t } from "../strings";
 import type { EngineKind, PluginState } from "../types";
@@ -63,20 +64,45 @@ function reopenWithNewUi(): void {
 }
 
 export function QuickAccess() {
-  const { state, error, refresh } = usePluginState();
+  const { state, error, refresh, setState } = usePluginState();
   const [busy, setBusy] = useState(false);
   const [pending, setPending] = useState<number | null>(null);
   const [pendingOriginalGain, setPendingOriginalGain] = useState<number | null>(null);
   const gainTimer = useRef<number | null>(null);
-  const originalGainTimer = useRef<number | null>(null);
+  const originalGainWriter = useRef<DebouncedValueWriter | null>(null);
   const operationBusy = useRef(false);
-  const engineKindRef = useRef<EngineKind>("converted");
   const stale = !!state && state.version !== FRONTEND_VERSION;
 
   useEffect(() => () => {
     if (gainTimer.current) window.clearTimeout(gainTimer.current);
-    if (originalGainTimer.current) window.clearTimeout(originalGainTimer.current);
   }, []);
+
+  useEffect(() => {
+    const writer = new DebouncedValueWriter({
+      delay: 300,
+      write: async (gain) => {
+        const result = await setOriginalGain(gain);
+        if (!result.ok || !Number.isFinite(result.outputGainDb)) throw new Error(t.originalOutputBoostFailed);
+        return result.outputGainDb;
+      },
+      onCommit: (gain, latest) => {
+        setState((current) => current ? {
+          ...current,
+          settings: { ...current.settings, original: { ...current.settings.original, outputGainDb: gain } },
+        } : current);
+        if (latest) setPendingOriginalGain(null);
+      },
+      onError: (saveError, latest) => {
+        if (latest) setPendingOriginalGain(null);
+        toaster.toast({ title: t.title, body: String(saveError) });
+      },
+    });
+    originalGainWriter.current = writer;
+    return () => {
+      writer.dispose();
+      if (originalGainWriter.current === writer) originalGainWriter.current = null;
+    };
+  }, [setState]);
 
   useEffect(() => {
     if (stale) reopenWithNewUi();
@@ -106,7 +132,6 @@ export function QuickAccess() {
 
   const s = state;
   const engineKind = s.engine?.kind ?? s.settings.engine?.kind ?? "converted";
-  engineKindRef.current = engineKind;
   const original = engineKind === "original";
   const originalAvailable = s.engine?.available === true;
   const originalLabel = s.engine?.engineLabel || t.engineOriginal;
@@ -130,7 +155,10 @@ export function QuickAccess() {
     if (operationBusy.current) return;
     operationBusy.current = true;
     setBusy(true);
+    const gainWriter = originalGainWriter.current;
+    gainWriter?.pause();
     try {
+      await gainWriter?.waitForActive();
       await fn();
     } catch (e) {
       toaster.toast({ title: t.title, body: String(e) });
@@ -138,6 +166,7 @@ export function QuickAccess() {
       await refresh();
       operationBusy.current = false;
       setBusy(false);
+      gainWriter?.resume();
     }
   };
 
@@ -152,10 +181,7 @@ export function QuickAccess() {
       window.clearTimeout(gainTimer.current);
       gainTimer.current = null;
     }
-    if (originalGainTimer.current) {
-      window.clearTimeout(originalGainTimer.current);
-      originalGainTimer.current = null;
-    }
+    originalGainWriter.current?.cancel();
     setPending(null);
     setPendingOriginalGain(null);
     void run(async () => {
@@ -174,26 +200,12 @@ export function QuickAccess() {
   };
 
   const onOriginalGain = (value: number) => {
-    if (!original || engineBusy || !Number.isFinite(value)) return;
+    if (!original || engineBusy || operationBusy.current || !Number.isFinite(value)) return;
     const gain = Math.max(0, Math.min(12, Math.round(value * 2) / 2));
     setPendingOriginalGain(gain);
-    if (originalGainTimer.current) window.clearTimeout(originalGainTimer.current);
-    const apply = () => {
-      originalGainTimer.current = null;
-      if (engineKindRef.current !== "original") {
-        setPendingOriginalGain(null);
-        return;
-      }
-      if (operationBusy.current) {
-        originalGainTimer.current = window.setTimeout(apply, 150);
-        return;
-      }
-      void run(async () => {
-        const result = await setOriginalGain(gain);
-        if (!result.ok) throw new Error(t.originalOutputBoostFailed);
-      }).finally(() => setPendingOriginalGain(null));
-    };
-    originalGainTimer.current = window.setTimeout(apply, 300);
+    // Keep the focused slider enabled while saving. Disabling a Steam slider
+    // transfers controller focus, so the next Left/Right can leave this menu.
+    originalGainWriter.current?.submit(gain);
   };
 
   const onInstallUpdate = () =>

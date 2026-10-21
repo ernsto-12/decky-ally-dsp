@@ -20,6 +20,8 @@ Version 0.3.0 requires re-importing the verified private pack with `speaker-game
 
 While the original engine is active, the physical output remains the volume and mute master, so the handheld's volume keys act directly on the speakers. The virtual input displays the same controls and changes there are mirrored back to the physical output. Its monitor passes unattenuated PCM to the DLL to avoid double attenuation. Decky observes sink changes to keep the controls in sync; the physical volume keys continue working if Decky stops.
 
+While Decky is running, the plugin checks the desired ON state after suspend/resume and original-engine failures. Recovery checks the live daemon, heartbeat, output identity and channel routes, then rebuilds the audio path when needed. It preserves OFF and user volume/mute/boost settings and waits while the audio session returns. Output boost remains adjustable during its own save so controller focus stays on the slider.
+
 The remainder describes the upstream converted engine.
 
 Decky Loader plugin that brings the Dolby speaker tuning of the ASUS ROG Ally
