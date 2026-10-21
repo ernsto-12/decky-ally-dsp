@@ -1,4 +1,16 @@
-# Ally DSP
+# Ally DSP: original-engine fork
+
+This is [ernsto-12/decky-ally-dsp](https://github.com/ernsto-12/decky-ally-dsp), an experimental fork of [bassobr/Ally DSP](https://github.com/bassobr/decky-ally-dsp). The upstream MIT license and notices are retained.
+
+The fork adds a choice between the existing converted speaker chain and a persistent original Dolby DLL engine hosted by Proton. **It replaces the installed Ally DSP**, using the same Decky identity and `ally-dsp.service`. Installing two copies with different folders is unsupported. Only one engine runs at a time. The installer backs up the previous plugin, settings and service before replacement; it keeps private tuning and assets in the data directory.
+
+The original engine selects the official **speaker Game** or **generic headphone Game** configuration when the internal analog route changes. Both accept 48 kHz, six-channel PCM mapped to static audio objects through the original frontend and processing DLL. The headphone configuration renders binaural stereo; the tested speaker configuration applies its separate stereo spatial path. It does not receive Windows Atmos object metadata or decode Atmos bitstreams from ordinary PipeWire PCM. This profile does not establish identical built-in speaker calibration or a complete replacement for Dolby Access.
+
+On an RC73XA running SteamOS 3.8.28, 18 offline frontend conditions were byte-identical to Windows. A persistent original HRTF worker also reproduced the Windows six-channel reference exactly. Isolated PipeWire null-sink tests verified capture, processing and playback PCM. These are channel-bed and transport checks; game compatibility, long-session stability and perceived sound still require testing.
+
+Original assets are imported locally with `scripts/import-original-engine.py --help`. The public release includes host code, not Dolby DLLs, OEM blobs, Windows Python or a Proton distribution. Until the private assets are imported, the original option is unavailable and the converted engine remains usable. In original mode, the imported pack fixes the effective Game profile for the active speaker/headphone route; converted per-game presets, voicings and extras remain saved for the converted engine.
+
+The remainder describes the upstream converted engine.
 
 Decky Loader plugin that brings the Dolby speaker tuning of the ASUS ROG Ally
 handhelds (ROG Xbox Ally X, ROG Xbox Ally, ROG Ally X) to SteamOS. On Windows the
@@ -44,7 +56,7 @@ Requirements: SteamOS 3.8 or newer, Decky Loader, internet access during setup
 With Decky Loader installed, open Konsole in Desktop Mode:
 
 ```bash
-curl -sL https://github.com/bassobr/decky-ally-dsp/raw/main/install.sh -o /tmp/ally-dsp-install.sh && sudo bash /tmp/ally-dsp-install.sh
+curl -fsSL https://raw.githubusercontent.com/ernsto-12/decky-ally-dsp/main/install.sh -o /tmp/ally-dsp-install.sh && sudo bash /tmp/ally-dsp-install.sh
 ```
 
 Then open the Quick Access menu → Decky → Ally DSP → Setup. Updates are offered

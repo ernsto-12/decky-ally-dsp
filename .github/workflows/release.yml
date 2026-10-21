@@ -67,13 +67,21 @@ jobs:
           name: plugin-zip
       # Verify against the committed key so a seed/key mismatch fails the release.
       - name: Sign SHA256SUMS
+        id: sign
         env:
           MINISIGN_SEED: ${{ secrets.MINISIGN_SEED }}
         run: |
+          if [ -z "$MINISIGN_SEED" ]; then
+            echo "No CI signing key configured; publish locally signed release artifacts instead."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           PYTHONPATH=py_modules python3 -m allydsp.minisign sign SHA256SUMS --pub minisign.pub \
             --trusted-comment "ally-dsp ${GITHUB_REF_NAME}"
           PYTHONPATH=py_modules python3 -m allydsp.minisign verify SHA256SUMS SHA256SUMS.minisig minisign.pub
+          echo "signed=true" >> "$GITHUB_OUTPUT"
       - name: Create GitHub release
+        if: steps.sign.outputs.signed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

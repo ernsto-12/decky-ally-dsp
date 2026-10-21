@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 PLUGIN_NAME = "Ally DSP"
-GITHUB_REPO = "bassobr/decky-ally-dsp"
+GITHUB_REPO = "ernsto-12/decky-ally-dsp"
 RELEASE_ZIP_TEMPLATE = "ally-dsp-{version}.zip"
-USER_AGENT = "ally-dsp/decky (+https://github.com/bassobr/decky-ally-dsp)"
+USER_AGENT = "ally-dsp/decky (+https://github.com/ernsto-12/decky-ally-dsp)"
 
 # Dolby profile ids from the DAX3 XML, in display order.
 PROFILES = [

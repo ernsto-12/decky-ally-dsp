@@ -9,16 +9,18 @@ from .log import logger
 
 
 class JackWatcher:
-    def __init__(self, interval: float = 3.0, on_change: Optional[Callable[[Dict[str, Any]], Any]] = None):
+    def __init__(self, interval: float = 3.0, on_change: Optional[Callable[[Dict[str, Any]], Any]] = None,
+                 lifecycle_lock=None):
         self.interval = interval
         self.on_change = on_change
         self.headphones: Optional[bool] = None
         self._task: Optional[asyncio.Task] = None
+        self.lifecycle_lock = lifecycle_lock
 
     @property
     def paused(self) -> bool:
         """The chain stays off while headphones use the shared sink, whoever stopped it."""
-        return bool(self.headphones)
+        return bool(self.headphones and dsp_runtime.pause_for_headphones())
 
     def state(self) -> Dict[str, Any]:
         return {"headphones": self.headphones, "paused": self.paused}
@@ -33,6 +35,13 @@ class JackWatcher:
             self._task = None
 
     async def poll(self, should_run: Callable[[], bool]) -> None:
+        if self.lifecycle_lock is None:
+            await self._poll(should_run)
+        else:
+            async with self.lifecycle_lock:
+                await self._poll(should_run)
+
+    async def _poll(self, should_run: Callable[[], bool]) -> None:
         dump = await asyncio.to_thread(hardware.pw_dump)
         if not dump:
             return
@@ -41,7 +50,7 @@ class JackWatcher:
             return
         first = self.headphones is None  # the backend's startup reconcile starts the chain
         self.headphones = hp
-        if hp:
+        if hp and dsp_runtime.pause_for_headphones():
             if await asyncio.to_thread(dsp_runtime.is_active):
                 await asyncio.to_thread(dsp_runtime.stop)
                 logger.info("headphones detected: chain paused")

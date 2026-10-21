@@ -1,11 +1,20 @@
 {
   "name": "Ally DSP",
-  "author": "bassobr",
+  "author": "bassobr; original-engine fork by ernsto-12",
   "flags": [],
   "api_version": 1,
   "publish": {
-    "tags": ["audio", "dsp", "dolby", "speakers", "rog-ally", "rog-ally-x", "xbox-ally", "pipewire"],
-    "description": "Dolby speaker tuning for ASUS ROG Ally handhelds on SteamOS as a PipeWire filter chain, with global or per-game presets.",
+    "tags": [
+      "audio",
+      "dsp",
+      "dolby",
+      "speakers",
+      "rog-ally",
+      "rog-ally-x",
+      "xbox-ally",
+      "pipewire"
+    ],
+    "description": "Ally DSP with a converted speaker chain or experimental original Dolby headphone Game engine.",
     "image": ""
   }
 }

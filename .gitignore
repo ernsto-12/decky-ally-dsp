@@ -12,6 +12,16 @@ __pycache__/
 # local-only data: proprietary tuning, signing seed, test artefacts
 local/
 *.secret
+*.seed
+*.dll
+*.exe
+*.bin
+*.f32
+*.wav
+host.txt
+engine.json
+runtime.json
+private/
 # editors / os
 .vscode/settings.json
 .idea/

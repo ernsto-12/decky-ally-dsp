@@ -16,6 +16,7 @@ import {
   checkForUpdate,
   installViaDecky,
   prepareUpdate,
+  setEngine,
   setEnabled,
   setExtras,
   setGlobal,
@@ -24,7 +25,7 @@ import {
 import { usePluginState } from "../hooks/usePluginState";
 import { setupIntent } from "../setupIntent";
 import { t } from "../strings";
-import type { PluginState } from "../types";
+import type { EngineKind, PluginState } from "../types";
 import { FRONTEND_VERSION } from "../version";
 
 function goto(path: string) {
@@ -33,6 +34,10 @@ function goto(path: string) {
 }
 
 function statusText(s: PluginState): string {
+  if ((s.engine?.kind ?? s.settings.engine?.kind) === "original") {
+    if (!s.settings.enabled) return `${t.inactive} (Bypass)`;
+    return s.dsp.active && s.dsp.verified && s.dsp.original?.ready ? t.active : t.inactive;
+  }
   if (!s.setup.done) return t.notSetUp;
   if (s.dsp.jack?.paused || (s.hardware.headphones && !s.dsp.active)) return t.pausedHeadphones;
   if (!s.settings.enabled) return `${t.inactive} (Bypass)`;
@@ -61,6 +66,7 @@ export function QuickAccess() {
   const [busy, setBusy] = useState(false);
   const [pending, setPending] = useState<number | null>(null);
   const gainTimer = useRef<number | null>(null);
+  const operationBusy = useRef(false);
   const stale = !!state && state.version !== FRONTEND_VERSION;
 
   useEffect(() => () => {
@@ -94,25 +100,57 @@ export function QuickAccess() {
   }
 
   const s = state;
+  const engineKind = s.engine?.kind ?? s.settings.engine?.kind ?? "converted";
+  const original = engineKind === "original";
+  const originalAvailable = s.engine?.available === true;
+  const originalLabel = s.engine?.engineLabel || t.engineOriginal;
+  const engineOptions = [
+    { data: "converted" as EngineKind, label: t.engineConverted },
+    ...(originalAvailable || original ? [{ data: "original" as EngineKind, label: originalLabel }] : []),
+  ];
+  const engineBusy = busy || s.setup.inProgress || s.setup.converting;
+  const workerError = s.dsp.original?.error || (!originalAvailable ? s.engine?.error : null);
+  const workerReady = s.dsp.active && s.dsp.verified && s.dsp.original?.ready;
   const resolved = s.runningApp.resolved;
   const appId = s.runningApp.appId;
   const perApp = appId ? s.settings.perApp[appId] : undefined;
   const profileOptions = s.profiles.map((p) => ({ data: p.id, label: p.label }));
   const voicingOptions = s.voicings.map((v) => ({ data: v.id, label: v.label }));
-  const activeLabel = s.dsp.active_preset?.profile
+  const activeLabel = original ? originalLabel : s.dsp.active_preset?.profile
     ? `${labelOf(s.profiles, s.dsp.active_preset.profile)} · ${labelOf(s.voicings, s.dsp.active_preset.voicing ?? "")}`
     : "–";
 
   const run = async (fn: () => Promise<unknown>) => {
+    if (operationBusy.current) return;
+    operationBusy.current = true;
     setBusy(true);
     try {
       await fn();
     } catch (e) {
       toaster.toast({ title: t.title, body: String(e) });
     } finally {
+      await refresh();
+      operationBusy.current = false;
       setBusy(false);
-      void refresh();
     }
+  };
+
+  const onEngine = (kind: EngineKind) => {
+    if (kind === engineKind || engineBusy || operationBusy.current) return;
+    if (kind === "original" && !originalAvailable) {
+      toaster.toast({ title: t.title, body: s.engine?.error || t.engineUnavailableDesc });
+      return;
+    }
+    // Do not send a delayed converter control after selecting another engine.
+    if (gainTimer.current) {
+      window.clearTimeout(gainTimer.current);
+      gainTimer.current = null;
+    }
+    setPending(null);
+    void run(async () => {
+      const result = await setEngine(kind);
+      if (!result.ok) throw new Error(t.workerError);
+    });
   };
 
   const onGain = (value: number) => {
@@ -134,14 +172,14 @@ export function QuickAccess() {
     <>
       <PanelSection title={t.status}>
         <PanelSectionRow>
-          <Field label={statusText(s)} description={`${activeLabel}${resolved.source === "app" ? ` · ${t.thisGame}` : ""}`} />
+          <Field label={statusText(s)} description={`${activeLabel}${!original && resolved.source === "app" ? ` · ${t.thisGame}` : ""}`} />
         </PanelSectionRow>
         {stale && (
           <PanelSectionRow>
             <Field label={t.staleUi} description={`UI ${FRONTEND_VERSION}, backend ${s.version}`} />
           </PanelSectionRow>
         )}
-        {!s.setup.done && (
+        {!s.setup.done && !original && (
           <PanelSectionRow>
             <ButtonItem layout="below" description={t.setupNeeded} onClick={() => { setupIntent.force = false; goto("/ally-dsp/setup"); }}>
               {t.runSetup}
@@ -155,13 +193,42 @@ export function QuickAccess() {
         )}
       </PanelSection>
 
-      {s.setup.done && (
+      <PanelSection title={t.engine}>
+        <PanelSectionRow>
+          <DropdownItem label={t.engine} rgOptions={engineOptions} selectedOption={engineKind} disabled={engineBusy}
+            onChange={(option) => onEngine(option.data)} />
+        </PanelSectionRow>
+        {!originalAvailable && (
+          <PanelSectionRow>
+            <Field label={t.engineUnavailable} description={s.engine?.error || t.engineUnavailableDesc} />
+          </PanelSectionRow>
+        )}
+        {original && (
+          <>
+            <PanelSectionRow>
+              <Field label={originalLabel} description={t.engineFixedProfile} />
+            </PanelSectionRow>
+            {s.engine?.scope && (
+              <PanelSectionRow>
+                <Field label={t.engineScope} description={s.engine.scope} />
+              </PanelSectionRow>
+            )}
+            <PanelSectionRow>
+              <Field label={t.worker} description={!s.settings.enabled ? t.workerStopped : workerError
+                ? `${t.workerError}: ${workerError}` : workerReady ? t.workerReady : t.workerStarting} />
+            </PanelSectionRow>
+          </>
+        )}
+      </PanelSection>
+
+      {(s.setup.done || original) && (
         <>
           <PanelSection title={t.sound}>
             <PanelSectionRow>
               <ToggleField label={t.dspEnabled} description={t.dspEnabledDesc} checked={s.settings.enabled} disabled={busy}
                 onChange={(v) => void run(() => setEnabled(v))} />
             </PanelSectionRow>
+            {!original && <>
             <PanelSectionRow>
               <DropdownItem label={t.preset} rgOptions={profileOptions} selectedOption={s.settings.global.profile} disabled={busy}
                 onChange={(o) => void run(() => setGlobal(o.data, s.settings.global.voicing))} />
@@ -170,8 +237,10 @@ export function QuickAccess() {
               <DropdownItem label={t.voicing} rgOptions={voicingOptions} selectedOption={s.settings.global.voicing} disabled={busy}
                 onChange={(o) => void run(() => setGlobal(s.settings.global.profile, o.data))} />
             </PanelSectionRow>
+            </>}
           </PanelSection>
 
+          {!original && <>
           <PanelSection title={appId ? `${t.thisGame}: ${appName(appId)}` : t.thisGame}>
             {appId ? (
               <>
@@ -240,6 +309,7 @@ export function QuickAccess() {
                 notchCount={13} disabled={busy || s.setup.inProgress} onChange={onGain} />
             </PanelSectionRow>
           </PanelSection>
+          </>}
         </>
       )}
 

@@ -1,5 +1,5 @@
 import { callable } from "@decky/api";
-import type { DspState, Extras, PerAppEntry, PluginState, SetupProgress, UpdateArtifact, UpdateInfo } from "./types";
+import type { DspState, EngineKind, EngineState, Extras, PerAppEntry, PluginState, SetupProgress, UpdateArtifact, UpdateInfo } from "./types";
 
 export const getState = callable<[], PluginState>("get_state");
 export const runSetup = callable<[force: boolean, allowUnsupported: boolean], { started: boolean; reason?: string }>("run_setup");
@@ -9,6 +9,7 @@ export const setGlobal = callable<[profile: string, voicing: string], { ok: bool
 export const setPerApp = callable<[appId: string, entry: PerAppEntry | null], { ok: boolean }>("set_per_app");
 export const onRunningAppChanged = callable<[appId: string | null], { appId: string | null }>("on_running_app_changed");
 export const setEnabled = callable<[enabled: boolean], DspState>("set_enabled");
+export const setEngine = callable<[kind: EngineKind], { ok: boolean; engine: EngineState }>("set_engine");
 export const setExtras = callable<[extras: Partial<Extras>], { ok: boolean; extras: Extras; reconverting: boolean }>("set_extras");
 export const checkForUpdate = callable<[force: boolean], UpdateInfo>("check_for_update");
 export const prepareUpdate = callable<[], UpdateArtifact>("prepare_update");

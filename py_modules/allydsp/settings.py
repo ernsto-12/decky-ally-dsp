@@ -13,6 +13,7 @@ from .util import read_json, write_json
 DEFAULTS: Dict[str, Any] = {
     "schema": 1,
     "enabled": True,
+    "engine": {"kind": "converted"},
     "global": {"profile": DEFAULT_PROFILE, "voicing": DEFAULT_VOICING},
     "perApp": {},
     "extras": {"autogain": True, "dialog": True, "regulator": True, "virtualBass": False, "preGainDb": 0.0},

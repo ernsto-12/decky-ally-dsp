@@ -19,3 +19,5 @@ fork of Arcada Labs' WiFi Optimizer); no code was copied from it.
 is proprietary. The plugin downloads ASUS' public driver package onto the
 user's own device during setup and extracts the file there; it is never
 redistributed with this project.
+
+The experimental original-engine fork distributes its own Python IPC, COM input and routing host code under MIT. DolbyAudioProcessing.dll, DolbyHrtfEnc.dll and OEM configuration blobs are proprietary and must be supplied locally; they are excluded from source and release archives. A user-supplied Windows Python embed runtime is subject to the Python license included with that runtime. Proton remains a separately installed Steam dependency. No Dolby trademark endorsement is implied.

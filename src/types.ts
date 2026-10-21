@@ -31,8 +31,20 @@ export interface Extras {
   preGainDb: number;
 }
 
+export type EngineKind = "converted" | "original";
+
+export interface EngineState {
+  kind: EngineKind;
+  /** Availability of the locally imported original engine assets. */
+  available: boolean;
+  error?: string | null;
+  engineLabel?: string | null;
+  scope?: string | null;
+}
+
 export interface Settings {
   enabled: boolean;
+  engine?: { kind: EngineKind };
   global: { profile: string; voicing: string };
   perApp: Record<string, PerAppEntry>;
   extras: Extras;
@@ -66,6 +78,8 @@ export interface DspState {
   active_preset: { profile?: string; voicing?: string; preGainDb?: number; applied_at?: string } | null;
   jack: { headphones: boolean | null; paused: boolean };
   enabled_setting: boolean;
+  engine?: EngineKind;
+  original?: { ready?: boolean; state?: string; error?: string | null };
 }
 
 export interface UpdateInfo {
@@ -78,6 +92,7 @@ export interface UpdateInfo {
 
 export interface PluginState {
   version: string;
+  engine?: EngineState;
   setup: Settings["setup"] & {
     xmlPresent: boolean;
     venvOk: boolean;

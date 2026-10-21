@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 from typing import Any, Dict, Optional
@@ -10,7 +11,7 @@ import decky  # type: ignore
 
 sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), "py_modules"))
 
-from allydsp import asus_fetch, convert, deckyfix, diagnostics, dsp_runtime, hardware, paths, settings, setup_flow, updater  # noqa: E402
+from allydsp import asus_fetch, convert, deckyfix, diagnostics, dsp_runtime, hardware, original_runtime, paths, settings, setup_flow, updater  # noqa: E402
 from allydsp.constants import PROFILES, VOICING_LABELS, VOICINGS  # noqa: E402
 from allydsp.jackwatch import JackWatcher  # noqa: E402
 
@@ -23,6 +24,7 @@ class Plugin:
         self.loop = asyncio.get_event_loop()
         paths.ensure_dirs()
         self.settings: Dict[str, Any] = settings.load()
+        self.engine_lock = asyncio.Lock()
         self.running_app: Optional[str] = None
         self.setup_task: Optional[asyncio.Task] = None
         self.setup_cancel = False
@@ -31,7 +33,7 @@ class Plugin:
         self.convert_last: Optional[Dict[str, Any]] = None
         self.update_task: Optional[asyncio.Task] = None
         self.lv2_cache: Optional[Dict[str, Any]] = None
-        self.jack = JackWatcher(on_change=self._on_jack_change)
+        self.jack = JackWatcher(on_change=self._on_jack_change, lifecycle_lock=self.engine_lock)
         self.jack.start(self._should_run)
         self.loop.create_task(self._startup())
         decky.logger.info("Ally DSP backend started (plugin dir %s)", paths.PLUGIN_DIR)
@@ -58,7 +60,7 @@ class Plugin:
         try:
             await asyncio.to_thread(dsp_runtime.cancel_removal)
             updater.remove_legacy_marker()
-            if self.settings["setup"].get("done"):
+            if self.settings["setup"].get("done") or dsp_runtime.engine_kind() == "original":
                 await self._reconcile()
             if self.settings["update"].get("autoCheck", True):
                 await self.check_for_update(False)
@@ -68,6 +70,13 @@ class Plugin:
     async def _reconcile(self) -> None:
         """Bring unit and active preset back after an update or lost data."""
         res = settings.resolve(self.settings, self.running_app)
+        if dsp_runtime.engine_kind() == "original":
+            await asyncio.to_thread(dsp_runtime.enable, False)
+            if self.settings.get("enabled"):
+                await self._apply_current(force_restart=True)
+            else:
+                await asyncio.to_thread(dsp_runtime.stop)
+            return
         have_presets = any(v for p in convert.list_presets().values() for v in p.values())
         if not have_presets or not asus_fetch.current_xml() or not await asyncio.to_thread(convert.venv_ok):
             decky.logger.warning("setup data incomplete, running setup again")
@@ -89,7 +98,8 @@ class Plugin:
 
     # ---------------------------------------------------------------- helpers
     def _should_run(self) -> bool:
-        return bool(self.settings.get("enabled") and self.settings["setup"].get("done"))
+        return bool(self.settings.get("enabled") and
+                    (self.settings.get("engine", {}).get("kind") == "original" or self.settings["setup"].get("done")))
 
     def _setup_running(self) -> bool:
         return bool(self.setup_task and not self.setup_task.done())
@@ -98,6 +108,11 @@ class Plugin:
         self.loop.call_soon_threadsafe(lambda: self.loop.create_task(decky.emit(event, payload)))
 
     async def _on_jack_change(self, state: Dict[str, Any]):
+        # JackWatcher invokes this while holding engine_lock. Original Game
+        # has separate verified speaker/headphone configurations; start() only
+        # restarts the worker when the active analog route selects another one.
+        if dsp_runtime.engine_kind() == "original" and self._should_run():
+            await self._apply_current_locked()
         await decky.emit("dsp_state", await self._dsp_state())
 
     async def _dsp_state(self) -> Dict[str, Any]:
@@ -111,8 +126,19 @@ class Plugin:
         settings.save_keeping(self.settings, "setup")
 
     async def _apply_current(self, force_restart: bool = False) -> Optional[Dict[str, Any]]:
+        async with self.engine_lock:
+            return await self._apply_current_locked(force_restart)
+
+    async def _apply_current_locked(self, force_restart: bool = False) -> Optional[Dict[str, Any]]:
         """Apply the resolved preset; restart the unit only when it changes."""
         res = settings.resolve(self.settings, self.running_app)
+        if dsp_runtime.engine_kind() == "original":
+            want_running = self._should_run()
+            result = await asyncio.to_thread(dsp_runtime.apply_preset, res["profile"], res["voicing"], 0.0, want_running)
+            if not want_running and await asyncio.to_thread(dsp_runtime.is_active):
+                await asyncio.to_thread(dsp_runtime.stop)
+            await decky.emit("dsp_state", await self._dsp_state())
+            return result
         if not convert.preset_available(res["profile"], res["voicing"]):
             decky.logger.warning("preset %s/%s not available yet", res["profile"], res["voicing"])
             return None
@@ -156,14 +182,55 @@ class Plugin:
                          "headphones": hardware.headphones_active(route), "lv2": self.lv2_cache},
             "dsp": await self._dsp_state(),
             "settings": self.settings,
+            "engine": await asyncio.to_thread(dsp_runtime.engine_status),
             "runningApp": {"appId": self.running_app, "resolved": settings.resolve(self.settings, self.running_app)},
             "update": self._update_info(),
             "profiles": [{"id": p, "label": l} for p, l in PROFILES],
             "voicings": [{"id": v, "label": VOICING_LABELS[v]} for v in VOICINGS],
         }
 
+    async def set_engine(self, kind: str) -> Dict[str, Any]:
+        if kind not in ("converted", "original"):
+            raise ValueError("Unknown audio engine")
+        if self._setup_running() or (self.convert_task and not self.convert_task.done()):
+            raise RuntimeError("Wait for setup or preset conversion to finish")
+        async with self.engine_lock:
+            if kind == dsp_runtime.engine_kind():
+                return {"ok": True, "engine": await asyncio.to_thread(dsp_runtime.engine_status)}
+            if kind == "original":
+                ready = await asyncio.to_thread(original_runtime.availability)
+                if not ready["available"]:
+                    raise RuntimeError(ready["error"])
+            snapshot = json.loads(json.dumps(self.settings))
+            was_active = await asyncio.to_thread(dsp_runtime.is_active)
+            try:
+                if not await asyncio.to_thread(dsp_runtime.stop):
+                    raise RuntimeError("Could not stop the current audio engine")
+                self.settings.setdefault("engine", {})["kind"] = kind
+                self._save()
+                await asyncio.to_thread(dsp_runtime.ensure_unit)
+                await asyncio.to_thread(dsp_runtime.enable, self._should_run())
+                await self._apply_current_locked(force_restart=True)
+            except Exception as error:
+                rollback_error = None
+                try:
+                    await asyncio.to_thread(dsp_runtime.stop)
+                    self.settings = snapshot
+                    self._save()
+                    await asyncio.to_thread(dsp_runtime.ensure_unit)
+                    await asyncio.to_thread(dsp_runtime.enable, self._should_run())
+                    if was_active:
+                        await self._apply_current_locked(force_restart=True)
+                except Exception as rollback:
+                    rollback_error = str(rollback)
+                suffix = "; recovery failed: " + rollback_error if rollback_error else "; previous engine restored"
+                raise RuntimeError(str(error) + suffix) from error
+        return {"ok": True, "engine": await asyncio.to_thread(dsp_runtime.engine_status)}
+
     # ---------------------------------------------------------------- setup
     async def run_setup(self, force: bool = False, allow_unsupported: bool = False) -> Dict[str, Any]:
+        if dsp_runtime.engine_kind() == "original":
+            raise RuntimeError("Select the converted engine before running its setup")
         if self.setup_task and not self.setup_task.done():
             return {"started": False, "reason": "already running"}
         self.setup_cancel = False
@@ -256,20 +323,23 @@ class Plugin:
         return {"appId": self.running_app, "resolved": settings.resolve(self.settings, self.running_app)}
 
     async def set_enabled(self, enabled: bool) -> Dict[str, Any]:
-        self.settings["enabled"] = bool(enabled)
-        self._save()
-        if enabled:
-            await asyncio.to_thread(dsp_runtime.ensure_unit)
-            await asyncio.to_thread(dsp_runtime.enable, True)
-            await self._apply_current(force_restart=True)
-        else:
-            await asyncio.to_thread(dsp_runtime.stop)
-            await asyncio.to_thread(dsp_runtime.enable, False)
+        async with self.engine_lock:
+            self.settings["enabled"] = bool(enabled)
+            self._save()
+            if enabled:
+                await asyncio.to_thread(dsp_runtime.ensure_unit)
+                await asyncio.to_thread(dsp_runtime.enable, True)
+                await self._apply_current_locked(force_restart=True)
+            else:
+                await asyncio.to_thread(dsp_runtime.stop)
+                await asyncio.to_thread(dsp_runtime.enable, False)
         state = await self._dsp_state()
         await decky.emit("dsp_state", state)
         return state
 
     async def set_extras(self, extras: Dict[str, Any]) -> Dict[str, Any]:
+        if dsp_runtime.engine_kind() == "original":
+            raise RuntimeError("These controls apply to the converted engine; its saved settings are preserved")
         old = dict(self.settings["extras"])
         new = dict(old)
         for k in ("autogain", "dialog", "regulator", "virtualBass"):

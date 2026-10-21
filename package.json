@@ -1,7 +1,7 @@
 {
   "name": "ally-dsp",
-  "version": "0.1.10",
-  "description": "Decky plugin: Dolby speaker tuning for ASUS ROG Ally handhelds on SteamOS",
+  "version": "0.2.0",
+  "description": "Ally DSP fork with experimental original Dolby DLL processing for SteamOS",
   "type": "module",
   "packageManager": "pnpm@11.20.0",
   "scripts": {
@@ -12,7 +12,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/bassobr/decky-ally-dsp.git"
+    "url": "git+https://github.com/ernsto-12/decky-ally-dsp.git"
   },
   "keywords": [
     "decky",
@@ -28,9 +28,9 @@
   "author": "bassobr",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/bassobr/decky-ally-dsp/issues"
+    "url": "https://github.com/ernsto-12/decky-ally-dsp/issues"
   },
-  "homepage": "https://github.com/bassobr/decky-ally-dsp#readme",
+  "homepage": "https://github.com/ernsto-12/decky-ally-dsp#readme",
   "devDependencies": {
     "@decky/rollup": "^1.0.2",
     "@decky/ui": "^4.11.0",
