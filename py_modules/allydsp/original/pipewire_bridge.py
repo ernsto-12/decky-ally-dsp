@@ -180,6 +180,38 @@ def main():
     clean = False
     io_stopped = False
     ready = threading.Event()
+    control_state = {'request_id': None, 'result': None, 'error': None}
+    controls_file = Path(config['controls_file']) if config.get('controls_file') else None
+    control_identity = None
+    last_control_check = 0.0
+
+    def apply_control_file():
+        nonlocal control_identity
+        if controls_file is None:
+            return
+        try:
+            info = controls_file.lstat()
+            identity = (info.st_ino, info.st_mtime_ns, info.st_size)
+            if identity == control_identity:
+                return
+            if controls_file.is_symlink() or not controls_file.is_file() or info.st_size > 32768:
+                raise ValueError('Expected a bounded regular control request')
+            raw = controls_file.read_bytes()
+            if len(raw) > 32768:
+                raise ValueError('Control request exceeds its limit')
+            request = json.loads(raw)
+            if (request.get('schema') != 'ally-dsp-original-control-request-v1'
+                    or not re.fullmatch(r'[0-9a-f]{32}', str(request.get('id', '')))):
+                raise ValueError('Invalid control request identity')
+        except (OSError, ValueError, TypeError) as caught:
+            control_state['error'] = str(caught)
+            return
+        # Runtime validation happens before the original receiver is called.
+        # A receiver/transport failure terminates this bridge and restores the
+        # bypass route instead of continuing with an uncertain partial update.
+        result = worker.configure(request['controls'], preset=request.get('preset'), voicing=request.get('voicing'))
+        control_identity = identity
+        control_state.update(request_id=request['id'], result=result, error=None)
     capture_name, playback_name = namespace + '.capture', namespace + '.playback'
     def publish_status(state, *, last_error=None):
         metadata = worker.metadata if worker is not None else {}
@@ -196,6 +228,7 @@ def main():
             'playback_silent_prefill_frames': audit.get('playback_silent_prefill_frames'),
             'end_to_end_latency_measured': False,
             'counters': dict(counters), 'last_error': last_error,
+            'controls': dict(control_state),
             'audit_directory': str(audit_dir), 'updated_unix_seconds': time.time()})
     publish_status('starting')
     def diagnostics(name):
@@ -269,6 +302,10 @@ def main():
         if worker.input_channels != len(positions) or worker.output_channels != 2 or worker.sample_rate != 48000:
             raise ValueError('Worker format differs from explicit PipeWire channel map')
         audit['worker_metadata'] = worker.metadata
+        if controls_file is not None:
+            apply_control_file()
+            if control_state['error']:
+                raise ValueError(control_state['error'])
         block_bytes = worker.frames * worker.input_channels * 4
         capture_cmd = pcm_command(remote, capture_name, worker.input_channels, positions, capture=True)
         playback_latency = int(config.get('playback_latency_frames', 1024))
@@ -353,6 +390,13 @@ def main():
                     if duration and time.monotonic() - began >= duration:
                         clean = True
                         break
+                    now = time.monotonic()
+                    if controls_file is not None and now - last_control_check >= .1:
+                        previous_request = control_state['request_id']
+                        apply_control_file()
+                        last_control_check = now
+                        if control_state['request_id'] != previous_request:
+                            publish_status('ready' if ready.is_set() else 'starting')
                     try:
                         payload = fifo.get(timeout=.1 if ready.is_set() else .005)
                     except queue.Empty:

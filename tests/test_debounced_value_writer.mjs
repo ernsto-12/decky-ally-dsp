@@ -181,3 +181,40 @@ test("unmount cancels pending writes and suppresses callbacks from an active req
   assert.deepEqual(h.commits, []);
   assert.deepEqual(h.errors, []);
 });
+
+test("Dolby object writes retain changes from different sliders while a request is active", async () => {
+  const h = harness();
+  const first = { eqEnabled: true, eqBandsDb: [-0.5, ...Array(19).fill(0)] };
+  const next = { ...first, dialogEnabled: true, dialogAmount: 8 };
+  h.writer.submit(first);
+  await h.advance(300);
+  h.writer.submit(next);
+  await h.advance(1000);
+  assert.equal(h.requests.length, 1);
+  assert.deepEqual(h.requests[0].value, first);
+  const firstState = { available: true, overrides: first, effective: first };
+  h.requests[0].resolve(firstState);
+  await microtasks();
+  await h.advance(0);
+  assert.deepEqual(h.requests[1].value, next);
+  const nextState = { available: true, overrides: next, effective: next };
+  h.requests[1].resolve(nextState);
+  await microtasks();
+  assert.deepEqual(h.commits, [{ value: firstState, latest: false }, { value: nextState, latest: true }]);
+});
+
+test("Restore official is an explicit empty object after an active Dolby override", async () => {
+  const h = harness();
+  h.writer.submit({ eqEnabled: true, ieqAmount: 12 });
+  await h.advance(300);
+  h.writer.submit({});
+  await h.advance(1000);
+  h.requests[0].resolve({ overrides: { eqEnabled: true, ieqAmount: 12 } });
+  await microtasks();
+  await h.advance(0);
+  assert.deepEqual(h.requests[1].value, {});
+  h.requests[1].resolve({ overrides: {}, effective: { eqEnabled: false, ieqAmount: 10 } });
+  await microtasks();
+  assert.equal(h.commits[1].latest, true);
+  assert.deepEqual(h.commits[1].value.overrides, {});
+});

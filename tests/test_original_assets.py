@@ -10,7 +10,8 @@ import pytest
 from allydsp import original_assets as assets
 
 PUBLIC_NAMES = {"protocol.py", "windows_worker.py", "linux_client.py", "pipewire_bridge.py",
-                "pipewire_graph.py", "hrtf_adapter.py", "frontend_adapter.py", "local_property_store.py", "vlldp_adapter.py"}
+                "pipewire_graph.py", "hrtf_adapter.py", "frontend_adapter.py", "local_property_store.py", "vlldp_adapter.py", "runtime_controls.py",
+                "object_protocol.py", "object_engine.py", "object_worker.py"}
 
 
 def digest(data):
@@ -80,6 +81,97 @@ def test_reimport_is_idempotent_and_preserves_generation(pack):
     assert first == second
     assert (runtime / "original/engine.json").read_bytes() == before
     assert len(list((runtime / "original/assets").iterdir())) == 1
+
+
+def _synthetic_profile_pack(monkeypatch):
+    from allydsp import original_profiles
+    catalog = {"schema": original_profiles.SCHEMA, "presets": ["game", "movie"],
+               "voicings": ["balanced", "warm"], "routes": {}}
+    payload = json.dumps(catalog).encode()
+    monkeypatch.setattr(original_profiles, "build_profile_pack", lambda *_: {
+        "catalog": catalog, "payloads": {"catalog.json": payload, "speakers/game-cp.bin": b"synthetic CP"}})
+    monkeypatch.setattr(original_profiles, "ensure_profile_xml_sources", lambda **_: (Path("speaker.xml"), Path("headphone.xml")))
+    return payload
+
+
+def test_profile_import_builds_a_separate_generation_and_keeps_legacy_files(pack, monkeypatch):
+    arguments, runtime, _ = pack
+    previous = assets.import_engine(**arguments)
+    previous_directory = runtime / "original/assets" / previous["generation"]
+    original_bytes = {p.relative_to(previous_directory).as_posix(): p.read_bytes()
+                      for p in previous_directory.rglob("*") if p.is_file()}
+    payload = _synthetic_profile_pack(monkeypatch)
+    result = assets.import_engine(**arguments, speaker_xml="speaker.xml", headphone_xml="headphone.xml")
+    assert result["generation"] != previous["generation"]
+    config = json.loads((runtime / "original/engine.json").read_text(encoding="utf-8"))
+    assert config["schema"] == "ally-dsp-original-engine-v2"
+    assert config["supported_presets"] == ["game", "movie"]
+    reference = config["profile_catalog"]
+    assert Path(reference["path"]).read_bytes() == payload
+    assert reference["sha256"] == digest(payload)
+    for route in config["profiles"].values():
+        command = route["worker"]["command"]
+        assert command[command.index("--profile-catalog-sha256") + 1] == digest(payload)
+        assert command[command.index("--preset") + 1] == "game"
+        assert command[command.index("--voicing") + 1] == "balanced"
+    assert original_bytes == {p.relative_to(previous_directory).as_posix(): p.read_bytes()
+                              for p in previous_directory.rglob("*") if p.is_file()}
+
+
+def test_upgrade_reuses_existing_vendor_python_and_moves_to_updated_public_bundle(pack, monkeypatch):
+    arguments, runtime, _ = pack
+    previous = assets.import_engine(**arguments)
+    old_manifest = (runtime / "original/engine.json").read_bytes()
+    _synthetic_profile_pack(monkeypatch)
+    # This is the update condition: installed public code has changed while the
+    # immutable generation still holds the earlier verified worker snapshot.
+    updated = arguments["public_dir"] / "windows_worker.py"
+    updated.write_bytes(b"new synthetic public worker")
+    monkeypatch.setattr(assets, "PUBLIC_PINS", dict(assets.PUBLIC_PINS, **{"windows_worker.py": digest(updated.read_bytes())}))
+    result = assets.upgrade_engine_profiles(runtime_dir=runtime, public_dir=arguments["public_dir"], allow_download=False)
+    assert result["generation"] != previous["generation"]
+    assert (runtime / "original/engine.json").read_bytes() != old_manifest
+    assert (runtime / "original/assets" / previous["generation"]).is_dir()
+    # A repeat is content addressed and does not construct another generation.
+    assert assets.upgrade_engine_profiles(runtime_dir=runtime, public_dir=arguments["public_dir"], allow_download=False) == result
+
+
+def test_upgrade_rejects_changed_existing_private_files_without_replacing_manifest(pack, monkeypatch):
+    arguments, runtime, _ = pack
+    previous = assets.import_engine(**arguments)
+    manifest = (runtime / "original/engine.json").read_bytes()
+    _synthetic_profile_pack(monkeypatch)
+    target = runtime / "original/assets" / previous["generation"] / "python-embed/python312.dll"
+    target.write_bytes(b"changed imported binary")
+    with pytest.raises(assets.AssetError, match="generation changed"):
+        assets.upgrade_engine_profiles(runtime_dir=runtime, public_dir=arguments["public_dir"])
+    assert (runtime / "original/engine.json").read_bytes() == manifest
+
+
+def test_profile_source_failure_preserves_existing_generation_and_manifest(pack, monkeypatch):
+    from allydsp import original_profiles
+    arguments, runtime, _ = pack
+    previous = assets.import_engine(**arguments)
+    manifest = (runtime / "original/engine.json").read_bytes()
+    def fail(**_):
+        raise ValueError("official XML unavailable")
+    monkeypatch.setattr(original_profiles, "ensure_profile_xml_sources", fail)
+    with pytest.raises(assets.AssetError, match="official XML unavailable"):
+        assets.upgrade_engine_profiles(runtime_dir=runtime, public_dir=arguments["public_dir"])
+    assert (runtime / "original/engine.json").read_bytes() == manifest
+    assert len(list((runtime / "original/assets").iterdir())) == 1
+    assert (runtime / "original/assets" / previous["generation"]).is_dir()
+
+
+@pytest.mark.parametrize("name", ["../outside", "/absolute", "a/../../outside", "C:outside", "a\\outside"])
+def test_profile_payload_cannot_escape_a_new_generation(pack, monkeypatch, name):
+    from allydsp import original_profiles
+    arguments, runtime, _ = pack
+    monkeypatch.setattr(original_profiles, "build_profile_pack", lambda *_: {
+        "catalog": {}, "payloads": {name: b"invalid"}})
+    with pytest.raises(assets.AssetError, match="payload path"):
+        assets.import_engine(**arguments, speaker_xml="speaker.xml", headphone_xml="headphone.xml")
+    assert not (runtime / "original/engine.json").exists()
 
 
 @pytest.mark.parametrize("component,name", [("source_dir", "DolbyAudioProcessing.dll"), ("source_dir", "speaker-game-supported-cp.bin"), ("source_dir", "DolbyDAXVLLDP160.dll"), ("source_dir", "speaker-game-vlldp-plan.json"), ("source_dir", "audioeng.dll"), ("public_dir", "windows_worker.py"), ("python_dir", "python312.dll")])

@@ -54,6 +54,10 @@ def test_shipped_registry_has_all_devices():
     assert reg["10431eb3"]["package"]["sha256"] == "9b0481de5cc3a474fb941031948f26e44cb4efad80a3e040290748bd7f9e87c2"
     assert reg["10431eb3"]["package"]["size"] == 8807856
     assert reg["10431384"]["package"]["version"] == "V11.130.1340.46"
+    from allydsp import original_profiles
+    assert reg["10431384"]["package"]["url"] == original_profiles.PACKAGE_URL
+    assert reg["10431384"]["package"]["sha256"] == original_profiles.PACKAGE_PIN
+    assert reg["10431384"]["package"]["size"] == original_profiles.PACKAGE_BYTES
     assert reg["10431394"]["package"] == reg["10431384"]["package"]
 
 

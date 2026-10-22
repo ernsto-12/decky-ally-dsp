@@ -4,25 +4,25 @@ interface Scheduler {
   clearTimeout(timer: ReturnType<typeof setTimeout>): void;
 }
 
-interface Options {
+interface Options<Value, Result> {
   delay: number;
-  write(value: number): Promise<number>;
-  onCommit(value: number, latest: boolean): void;
+  write(value: Value): Promise<Result>;
+  onCommit(value: Result, latest: boolean): void;
   onError(error: unknown, latest: boolean): void;
   scheduler?: Scheduler;
 }
 
 /** Coalesce slider input while keeping at most one backend write in flight. */
-export class DebouncedValueWriter {
+export class DebouncedValueWriter<Value = number, Result = Value> {
   private readonly scheduler: Scheduler;
   private timer: ReturnType<typeof setTimeout> | null = null;
-  private pending: { value: number; revision: number; due: number } | null = null;
+  private pending: { value: Value; revision: number; due: number } | null = null;
   private active: Promise<void> | null = null;
   private revision = 0;
   private paused = false;
   private disposed = false;
 
-  constructor(private readonly options: Options) {
+  constructor(private readonly options: Options<Value, Result>) {
     this.scheduler = options.scheduler ?? {
       now: () => Date.now(),
       setTimeout: (callback, delay) => setTimeout(callback, delay),
@@ -30,7 +30,7 @@ export class DebouncedValueWriter {
     };
   }
 
-  submit(value: number): void {
+  submit(value: Value): void {
     if (this.disposed) return;
     this.pending = { value, revision: ++this.revision, due: this.scheduler.now() + this.options.delay };
     this.schedule();

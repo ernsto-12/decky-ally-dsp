@@ -23,6 +23,7 @@ RUNTIME_FILE = os.path.join(ORIGINAL_DIR, "runtime.json")
 STATUS_FILE = os.path.join(ORIGINAL_DIR, "status.json")
 ROUTING_FILE = os.path.join(ORIGINAL_DIR, "routing.json")
 META_FILE = os.path.join(ORIGINAL_DIR, "active.json")
+CONTROLS_FILE = os.path.join(ORIGINAL_DIR, "controls.json")
 CAPTURE_SINK = "ally_dsp_original_input"
 NAMESPACE = "ally_dsp_original"
 POSITIONS = ["FL", "FR", "FC", "LFE", "RL", "RR"]
@@ -68,9 +69,9 @@ def _hash_file(path):
     return result
 
 
-def _configuration():
+def _configuration(preset=None, voicing=None):
     config = read_json(ENGINE_FILE)
-    if not isinstance(config, dict) or config.get("schema") != "ally-dsp-original-engine-v1":
+    if not isinstance(config, dict) or config.get("schema") not in ("ally-dsp-original-engine-v1", "ally-dsp-original-engine-v2"):
         raise RuntimeError("Import the locally owned Dolby engine assets first")
     if config.get("sample_rate") != 48000 or config.get("input_channels") != 6:
         raise RuntimeError("This runtime requires a verified 48 kHz / six-channel engine")
@@ -100,17 +101,67 @@ def _configuration():
         raise RuntimeError("Missing original-engine worker command")
     if not os.path.isfile(os.path.join(paths.PLUGIN_DIR, "py_modules", "allydsp", "original", "pipewire_bridge.py")):
         raise RuntimeError("The original-engine bridge is not installed")
+    catalog = config.get("profile_catalog")
+    if catalog:
+        if (not isinstance(catalog, dict) or not os.path.isabs(catalog.get("path", ""))
+                or os.path.islink(catalog["path"]) or _hash_file(catalog["path"]) != catalog.get("sha256")):
+            raise RuntimeError("The original profile catalog changed")
+        data = read_json(catalog["path"])
+        if not isinstance(data, dict) or data.get("schema") != "ally-dsp-original-profiles-v1":
+            raise RuntimeError("Invalid original profile catalog")
+        previous = read_json(META_FILE, {}) or {}
+        if preset is None:
+            preset = previous.get("profile") if previous.get("profile") in config.get("supported_presets", []) else "game"
+        if voicing is None:
+            voicing = previous.get("voicing") if previous.get("voicing") in config.get("supported_voicings", []) else "balanced"
+        if preset not in config.get("supported_presets", []) or voicing not in config.get("supported_voicings", []):
+            raise ValueError("Unsupported original preset or voicing")
+        worker = dict(worker, command=list(command))
+        for flag, value in (("--preset", preset), ("--voicing", voicing)):
+            if worker["command"].count(flag) != 1:
+                raise RuntimeError("Missing original profile launch parameter")
+            worker["command"][worker["command"].index(flag) + 1] = value
+        route_profiles = data["routes"][config["engine_profile"]]["profiles"]
+        post_hashes = {(row.get("post_plan") or {}).get("sha256") for row in route_profiles.values()}
+        config = dict(config, worker=worker, profile=preset, voicing=voicing,
+                      controls_available=True, profile_catalog_data=data,
+                      runtime_switchable=len(post_hashes) == 1,
+                      scope=data.get("scope", config.get("scope")),
+                      label="Original Dolby / " + ("Speaker" if config["engine_profile"] == "speakers" else "Headphone") + " " + preset.title())
     return config
 
 
 def availability() -> Dict[str, Any]:
     try:
+        _validate_hardware()
         config = _configuration()
-        return {"available": True, "error": None,
+        result = {"available": True, "error": None,
                 "engineLabel": config.get("label", "Original Dolby engine"),
                 "scope": config.get("scope", "Experimental original-DLL rendering")}
+        result.update(controlsAvailable=bool(config.get("controls_available")),
+                      supportedPresets=config.get("supported_presets", []))
+        from .original_assets import PUBLIC_PINS
+        imported = {os.path.basename(row["path"]): row.get("sha256") for row in config.get("files", [])
+                    if os.path.basename(os.path.dirname(row.get("path", ""))) == "worker"}
+        result["needsUpgrade"] = any(imported.get(name) != digest for name, digest in PUBLIC_PINS.items())
+        return result
     except Exception as error:
         return {"available": False, "error": str(error), "engineLabel": "Original Dolby engine", "scope": None}
+
+
+def _validate_hardware():
+    """The currently verified private speaker pack is specific to RC73XA."""
+    codec = hardware.codec_info()
+    if isinstance(codec, dict):
+        ssid = str(codec.get("ssid", "")).lower().removeprefix("0x")
+        device = str(codec.get("dev", "")).lower().removeprefix("0x")
+        if codec.get("supported") is True and ssid == "10431384" and device == "0294":
+            return codec
+        detected = "codec " + (device or "unknown") + ", subsystem " + (ssid or "unknown")
+    else:
+        detected = "no supported Realtek HDA codec"
+    raise RuntimeError("Original Dolby profiles are verified only for ROG Xbox Ally X RC73XA "
+                       "(Realtek 0294, subsystem 10431384); detected " + detected)
 
 
 def _unit_arg(value):
@@ -616,11 +667,34 @@ def _prepare_route_locked():
     _mirror_master(journal, physical_only=True)
 
 
-def start() -> bool:
-    config = _configuration()
+def _same_worker_base(left, right):
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    a, b = dict(left), dict(right)
+    a["command"], b["command"] = list(a.get("command", [])), list(b.get("command", []))
+    for flag in ("--preset", "--voicing"):
+        if a["command"].count(flag) != 1 or b["command"].count(flag) != 1:
+            return False
+        for worker in (a, b):
+            index = worker["command"].index(flag)
+            if index + 1 >= len(worker["command"]):
+                return False
+            worker["command"][index + 1] = "<selection>"
+    return a == b
+
+
+def start(config=None) -> bool:
+    _validate_hardware()
+    config = config or _configuration()
     active_runtime = read_json(RUNTIME_FILE, {}) or {}
     if converted_runtime.is_active() and verify(0) and active_runtime.get("engine_profile") == config["engine_profile"]:
-        return True
+        compatible = active_runtime.get("worker") == config["worker"]
+        compatible = compatible or (config.get("runtime_switchable") and _same_worker_base(active_runtime.get("worker"), config["worker"]))
+        if compatible:
+            if config.get("controls_available"):
+                apply_controls(settings.load().get("original", {}).get("controls", {}),
+                               preset=config["profile"], voicing=config["voicing"])
+            return True
     # is-active is false during deactivation, while a previous ExecStopPost may
     # still be pending. Finish that stop before writing a new routing journal;
     # otherwise old cleanup could unload the next session's new capture sink.
@@ -636,6 +710,10 @@ def start() -> bool:
                    "remote": "pipewire-0", "capture_sink": CAPTURE_SINK, "playback_sink": journal["physical_sink"],
                    "input_positions": POSITIONS, "worker": config["worker"], "status_path": STATUS_FILE,
                    "audit_directory": os.path.join(ORIGINAL_DIR, "audit"), "queue_blocks": 8, "retain_pcm": False}
+        if config.get("controls_available"):
+            _write_controls(settings.load().get("original", {}).get("controls", {}),
+                            preset=config["profile"], voicing=config["voicing"])
+            runtime["controls_file"] = CONTROLS_FILE
         write_json(RUNTIME_FILE, runtime)
         ensure_unit()
         if not converted_runtime.start() or not verify(45):
@@ -845,7 +923,7 @@ def apply_output_gain(value=None):
 
 
 def apply_preset(profile: str, voicing: str, pregain_db: float = 0.0, restart_unit: bool = True) -> Dict[str, Any]:
-    config = _configuration()
+    config = _configuration(profile, voicing)
     # Original assets carry an explicit verified profile; converted voicings do
     # not silently become unsupported original-DLL parameters.
     active = {"engine": "original", "profile": config.get("profile", "game"),
@@ -856,9 +934,64 @@ def apply_preset(profile: str, voicing: str, pregain_db: float = 0.0, restart_un
     os.makedirs(ORIGINAL_DIR, exist_ok=True)
     write_json(META_FILE, active)
     if restart_unit:
-        start()
+        start(config)
     active["verified"] = verify(0)
     return active
+
+
+def _write_controls(controls, *, preset=None, voicing=None):
+    from .original.runtime_controls import normalize_controls
+    request = {"schema": "ally-dsp-original-control-request-v1", "id": uuid.uuid4().hex,
+               "controls": normalize_controls(controls)}
+    previous = read_json(META_FILE, {}) or {}
+    preset = preset if preset is not None else previous.get("profile", "game")
+    voicing = voicing if voicing is not None else previous.get("voicing", "balanced")
+    if not settings.valid_profile(preset):
+        preset = "game"
+    if not settings.valid_voicing(voicing):
+        voicing = "balanced"
+    request.update(preset=preset, voicing=voicing)
+    os.makedirs(ORIGINAL_DIR, exist_ok=True)
+    atomic_write_text(CONTROLS_FILE, json.dumps(request, allow_nan=False) + "\n", mode=0o600)
+    return request
+
+
+def controls_state():
+    from .original.runtime_controls import controls_to_fields, fields_to_controls, normalize_controls
+    config = _configuration()
+    if not config.get("controls_available"):
+        return {"available": False, "overrides": {}, "effective": {}, "frequencies": []}
+    selected = config["profile_catalog_data"]["routes"][config["engine_profile"]]["profiles"][config["profile"]]
+    fields = dict(selected["cp"])
+    target = selected.get("voicings", {}).get(config["voicing"])
+    if target:
+        fields["ieq-bands-set"] = target
+    overrides = normalize_controls(settings.load().get("original", {}).get("controls", {}))
+    effective = controls_to_fields(overrides, fields, route=config["engine_profile"])
+    return {"available": True, "overrides": overrides, "effective": fields_to_controls(effective),
+            "official": fields_to_controls(fields),
+            "frequencies": fields.get("_band-frequencies", []), "preset": config["profile"],
+            "voicing": config["voicing"], "route": config["engine_profile"]}
+
+
+def apply_controls(controls, *, preset=None, voicing=None, timeout=4.0):
+    if not _configuration().get("controls_available"):
+        raise RuntimeError("Prepare the current original profile pack before using Dolby controls")
+    request = _write_controls(controls, preset=preset, voicing=voicing)
+    if not converted_runtime.is_active():
+        return {"applied": False, "requestId": request["id"]}
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = read_json(STATUS_FILE, {}) or {}
+        result = state.get("controls", {})
+        if result.get("request_id") == request["id"]:
+            if result.get("error"):
+                raise RuntimeError(result["error"])
+            return {"applied": True, "requestId": request["id"], "receipt": result.get("result")}
+        if not converted_runtime.is_active():
+            raise RuntimeError("Original engine stopped before the control update was acknowledged")
+        time.sleep(.05)
+    raise TimeoutError("Original control update was not acknowledged")
 
 
 def status(with_journal: bool = True) -> Dict[str, Any]:

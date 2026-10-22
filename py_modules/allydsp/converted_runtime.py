@@ -24,6 +24,9 @@ case "$4" in ""|/) exit 1 ;; esac
 systemctl --user disable --now "$2" || exit $?
 rm -f -- "$3"
 systemctl --user daemon-reload
+# Game-local COM registrations may still point into this private directory.
+# Keep their forwarding proxy and fallback launcher until explicitly removed.
+[ -d "$4/original/objects/games" ] && exit 0
 rm -rf -- "$4"
 """
 

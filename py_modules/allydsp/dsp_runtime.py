@@ -80,6 +80,30 @@ def restart() -> bool:
     return start()
 
 
+def resume_after_install() -> bool:
+    """Resume an enabled engine before Decky starts after a plugin update.
+
+    Original workers are immutable copies. Updating public adapters requires a
+    new private generation before the new runtime validates or starts them.
+    The installer snapshots the small generation descriptors for rollback.
+    """
+    state = settings.load()
+    if not state.get("enabled"):
+        return True
+    if engine_kind() == "original":
+        original_runtime._validate_hardware()
+        available = original_runtime.availability()
+        if not available.get("controlsAvailable") or available.get("needsUpgrade"):
+            from .original_assets import upgrade_engine_profiles
+            upgrade_engine_profiles()
+        # Stopping the old worker must not make installation take over a USB,
+        # Bluetooth or HDMI output selected by the user during that stop.
+        if original_runtime.health().get("reason") == "external-output-selected":
+            return True
+    ensure_unit()
+    return bool(start())
+
+
 def active_meta():
     return _backend().active_meta()
 

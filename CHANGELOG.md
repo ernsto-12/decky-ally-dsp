@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.5.0 (2026-10-22, original-engine fork)
+
+- Apply all five official speaker and generic headphone presets and all three
+  voicings through the original receiver. Global and per-game selections also
+  work in original mode, without restarting the DSP or PipeWire route.
+- Add original Dolby controls: 20-band EQ, intelligent EQ, dialog enhancer,
+  volume leveler and spatial processing. Coalesce slider writes, retain controller
+  focus and provide an explicit reset to the selected official profile.
+- Prepare the verified private profile catalog from pinned official ASUS XMLs;
+  automatically migrate an existing compatible pack while preserving its old
+  generation, preferences, hardware volume, mute and output boost.
+- Restore private engine descriptors as well as plugin files on installer
+  failure. Finish in-flight control transactions before releasing the engine
+  lock during cancellation.
+- Restrict original speaker tuning to the verified RC73XA codec. Preserve an
+  explicitly selected external output during startup and profile changes.
+- Verify 20 profile/control conditions against native Windows: Proton F32 and
+  WAV output are byte-identical, including live profile changes and resets.
+
+- Keep the deferred dynamic game-object prototype outside this PCM/Converted
+  release. No game-registration tools or proxy DLL are distributed.
+- Speed up finite-float validation while preserving exact NaN/Inf rejection
+  and the original DSP output.
+
 ## 0.3.1 (2026-10-22, original-engine fork)
 
 - Recover the desired ON state after suspend/resume or an original-engine

@@ -116,6 +116,8 @@ class OriginalRoutingTests(unittest.TestCase):
         self.stack.enter_context(patch.object(original, "run", self.audio.run))
         self.stack.enter_context(patch.object(original, "apply_output_gain", return_value={"applied": False}))
         self.stack.enter_context(patch.object(original.hardware, "pw_dump", lambda: []))
+        self.stack.enter_context(patch.object(original.hardware, "codec_info", return_value={
+            "ssid": "10431384", "dev": "0294", "supported": True}))
         self.stack.enter_context(patch.object(original.hardware, "find_speaker_sink",
                                              lambda _: next((s for s in self.audio.sinks if s["name"] == "speaker"), None)))
 
@@ -1204,6 +1206,8 @@ class OutputProfileTests(unittest.TestCase):
         ]:
             self.stack.enter_context(patch.object(target, key, value))
         self.stack.enter_context(patch.object(original.hardware, "pw_dump", return_value=[{}]))
+        self.stack.enter_context(patch.object(original.hardware, "codec_info", return_value={
+            "ssid": "10431384", "dev": "0294", "supported": True}))
         self.stack.enter_context(patch.object(original.hardware, "output_route", side_effect=lambda _: self.route))
         # Every process/service boundary is replaced, including on assertion failure.
         self.command = self.stack.enter_context(patch.object(original, "run", side_effect=AssertionError("Unexpected command")))
@@ -1244,7 +1248,8 @@ class OutputProfileTests(unittest.TestCase):
         self.assertEqual(selected["worker"]["command"], ["legacy-headphone-worker"])
 
     def test_ready_worker_with_same_profile_is_reused_without_route_mutation(self):
-        write_json(self.runtime_file, {"engine_profile": "speakers"})
+        write_json(self.runtime_file, {"engine_profile": "speakers",
+                                      "worker": self.manifest["profiles"]["speakers"]["worker"]})
         with patch.object(original.converted_runtime, "is_active", return_value=True), \
              patch.object(original, "verify", return_value=True) as verify, \
              patch.object(original.converted_runtime, "stop") as stop, \

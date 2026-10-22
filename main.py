@@ -88,6 +88,9 @@ class Plugin:
         res = settings.resolve(self.settings, self.running_app)
         if dsp_runtime.engine_kind() == "original":
             await asyncio.to_thread(dsp_runtime.enable, False)
+            available = await asyncio.to_thread(original_runtime.availability)
+            if not available.get("controlsAvailable") or available.get("needsUpgrade"):
+                await self.prepare_original_profiles()
             if self.settings.get("enabled"):
                 await self._apply_current(force_restart=True)
             else:
@@ -128,7 +131,7 @@ class Plugin:
         # has separate verified speaker/headphone configurations; start() only
         # restarts the worker when the active analog route selects another one.
         if dsp_runtime.engine_kind() == "original" and self._should_run():
-            await self._apply_current_locked()
+            await self._finish_mutation(self._apply_current_locked())
         await decky.emit("dsp_state", await self._dsp_state())
 
     async def _sync_original_master(self) -> None:
@@ -223,13 +226,24 @@ class Plugin:
 
     async def _apply_current(self, force_restart: bool = False) -> Optional[Dict[str, Any]]:
         async with self.engine_lock:
-            return await self._apply_current_locked(force_restart)
+            return await self._finish_mutation(self._apply_current_locked(force_restart))
 
     async def _apply_current_locked(self, force_restart: bool = False) -> Optional[Dict[str, Any]]:
         """Apply the resolved preset; restart the unit only when it changes."""
         res = settings.resolve(self.settings, self.running_app)
         if dsp_runtime.engine_kind() == "original":
             want_running = self._should_run()
+            if want_running:
+                output = await asyncio.to_thread(original_runtime.health)
+                if output.get("reason") == "external-output-selected":
+                    # Preparing profiles, startup and per-game selection must
+                    # preserve an explicitly selected USB/HDMI/Bluetooth sink.
+                    if not await asyncio.to_thread(dsp_runtime.stop):
+                        raise RuntimeError("Could not stop original audio while preserving the external output")
+                    result = await asyncio.to_thread(dsp_runtime.apply_preset, res["profile"], res["voicing"], 0.0, False)
+                    await decky.emit("dsp_state", await self._dsp_state())
+                    await decky.emit("original_controls_state", await self.get_original_controls())
+                    return result
             if force_restart:
                 if not await asyncio.to_thread(dsp_runtime.stop):
                     raise RuntimeError("Could not stop the original engine for recovery")
@@ -237,6 +251,7 @@ class Plugin:
             if not want_running and await asyncio.to_thread(dsp_runtime.is_active):
                 await asyncio.to_thread(dsp_runtime.stop)
             await decky.emit("dsp_state", await self._dsp_state())
+            await decky.emit("original_controls_state", await self.get_original_controls())
             return result
         if not convert.preset_available(res["profile"], res["voicing"]):
             decky.logger.warning("preset %s/%s not available yet", res["profile"], res["voicing"])
@@ -282,6 +297,7 @@ class Plugin:
             "dsp": await self._dsp_state(),
             "settings": self.settings,
             "engine": await asyncio.to_thread(dsp_runtime.engine_status),
+            "originalControls": await self.get_original_controls(),
             "runningApp": {"appId": self.running_app, "resolved": settings.resolve(self.settings, self.running_app)},
             "update": self._update_info(),
             "profiles": [{"id": p, "label": l} for p, l in PROFILES],
@@ -294,36 +310,42 @@ class Plugin:
         if self._setup_running() or (self.convert_task and not self.convert_task.done()):
             raise RuntimeError("Wait for setup or preset conversion to finish")
         async with self.engine_lock:
-            if kind == dsp_runtime.engine_kind():
-                return {"ok": True, "engine": await asyncio.to_thread(dsp_runtime.engine_status)}
-            if kind == "original":
-                ready = await asyncio.to_thread(original_runtime.availability)
-                if not ready["available"]:
-                    raise RuntimeError(ready["error"])
-            snapshot = json.loads(json.dumps(self.settings))
-            was_active = await asyncio.to_thread(dsp_runtime.is_active)
+            return await self._finish_mutation(self._set_engine_locked(kind))
+
+    async def _set_engine_locked(self, kind):
+        if kind == dsp_runtime.engine_kind():
+            return {"ok": True, "engine": await asyncio.to_thread(dsp_runtime.engine_status)}
+        if kind == "original":
+            ready = await asyncio.to_thread(original_runtime.availability)
+            if not ready["available"]:
+                raise RuntimeError(ready["error"])
+        snapshot = json.loads(json.dumps(self.settings))
+        was_active = await asyncio.to_thread(dsp_runtime.is_active)
+        try:
+            if not await asyncio.to_thread(dsp_runtime.stop):
+                raise RuntimeError("Could not stop the current audio engine")
+            self.settings.setdefault("engine", {})["kind"] = kind
+            self._save()
+            if kind == "original" and ready.get("needsUpgrade"):
+                from allydsp.original_assets import upgrade_engine_profiles
+                await asyncio.to_thread(upgrade_engine_profiles)
+            await asyncio.to_thread(dsp_runtime.ensure_unit)
+            await asyncio.to_thread(dsp_runtime.enable, self._should_run())
+            await self._apply_current_locked(force_restart=True)
+        except Exception as error:
+            rollback_error = None
             try:
-                if not await asyncio.to_thread(dsp_runtime.stop):
-                    raise RuntimeError("Could not stop the current audio engine")
-                self.settings.setdefault("engine", {})["kind"] = kind
+                await asyncio.to_thread(dsp_runtime.stop)
+                self.settings = snapshot
                 self._save()
                 await asyncio.to_thread(dsp_runtime.ensure_unit)
                 await asyncio.to_thread(dsp_runtime.enable, self._should_run())
-                await self._apply_current_locked(force_restart=True)
-            except Exception as error:
-                rollback_error = None
-                try:
-                    await asyncio.to_thread(dsp_runtime.stop)
-                    self.settings = snapshot
-                    self._save()
-                    await asyncio.to_thread(dsp_runtime.ensure_unit)
-                    await asyncio.to_thread(dsp_runtime.enable, self._should_run())
-                    if was_active:
-                        await self._apply_current_locked(force_restart=True)
-                except Exception as rollback:
-                    rollback_error = str(rollback)
-                suffix = "; recovery failed: " + rollback_error if rollback_error else "; previous engine restored"
-                raise RuntimeError(str(error) + suffix) from error
+                if was_active:
+                    await self._apply_current_locked(force_restart=True)
+            except Exception as rollback:
+                rollback_error = str(rollback)
+            suffix = "; recovery failed: " + rollback_error if rollback_error else "; previous engine restored"
+            raise RuntimeError(str(error) + suffix) from error
         return {"ok": True, "engine": await asyncio.to_thread(dsp_runtime.engine_status)}
 
     async def set_original_gain(self, gain_db: float) -> Dict[str, Any]:
@@ -344,6 +366,78 @@ class Plugin:
                     self._save()
                 raise
         return dict(result, ok=True)
+
+    async def get_original_controls(self) -> Dict[str, Any]:
+        try:
+            return await asyncio.to_thread(original_runtime.controls_state)
+        except Exception as error:
+            return {"available": False, "error": str(error), "overrides": {}, "effective": {}, "frequencies": []}
+
+    async def set_original_controls(self, controls: Dict[str, Any]) -> Dict[str, Any]:
+        from allydsp.original.runtime_controls import normalize_controls
+        value = normalize_controls(controls)
+        async with self.engine_lock:
+            if dsp_runtime.engine_kind() != "original":
+                raise RuntimeError("Select the original engine to change Dolby controls")
+            return await self._finish_mutation(self._set_original_controls_locked(value))
+
+    async def _finish_mutation(self, coroutine):
+        """Retain the caller's engine lock until a cancelled mutation finishes."""
+        operation = asyncio.create_task(coroutine)
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError as cancellation:
+            while not operation.done():
+                try:
+                    await asyncio.shield(operation)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            try:
+                operation.result()
+            except (Exception, asyncio.CancelledError) as error:
+                decky.logger.warning("Dolby mutation finished with an error during unload: %s", error)
+            raise cancellation
+
+    async def _set_original_controls_locked(self, value):
+        previous = dict(self.settings.get("original", {}))
+        self.settings.setdefault("original", {})["controls"] = value
+        try:
+            self._save()
+            result = await asyncio.to_thread(original_runtime.apply_controls, value)
+        except Exception:
+            self.settings["original"] = previous
+            self._save()
+            try:
+                await asyncio.to_thread(original_runtime._write_controls, previous.get("controls", {}))
+            except Exception as error:
+                decky.logger.warning("Could not restore previous Dolby control request: %s", error)
+            raise
+        state = await self.get_original_controls()
+        await decky.emit("original_controls_state", state)
+        return dict(result, ok=True, state=state)
+
+    async def prepare_original_profiles(self) -> Dict[str, Any]:
+        async with self.engine_lock:
+            return await self._finish_mutation(self._prepare_original_profiles_locked())
+
+    async def _prepare_original_profiles_locked(self):
+        from allydsp.original_assets import upgrade_engine_profiles
+        from allydsp.original_profiles import ensure_profile_xml_sources
+        await asyncio.to_thread(original_runtime._validate_hardware)
+        speaker_xml, headphone_xml = await asyncio.to_thread(ensure_profile_xml_sources)
+        was_active = await asyncio.to_thread(dsp_runtime.is_active)
+        if not await asyncio.to_thread(dsp_runtime.stop):
+            raise RuntimeError("Could not stop audio before preparing original profiles")
+        try:
+            result = await asyncio.to_thread(upgrade_engine_profiles, speaker_xml=speaker_xml, headphone_xml=headphone_xml)
+        finally:
+            if was_active and self._should_run():
+                await self._apply_current_locked(force_restart=True)
+        state = await self.get_original_controls()
+        await decky.emit("original_controls_state", state)
+        return dict(result, state=state)
 
     # ---------------------------------------------------------------- setup
     async def run_setup(self, force: bool = False, allow_unsupported: bool = False) -> Dict[str, Any]:

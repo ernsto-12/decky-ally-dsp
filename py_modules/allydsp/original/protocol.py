@@ -10,8 +10,26 @@ HEADER = struct.Struct('<4sHHIIII')
 REQUEST_MAGIC = b'ADSP'
 RESPONSE_MAGIC = b'ADSR'
 VERSION = 1
-READY, PROCESS, QUIT, ERROR = 0, 1, 3, 0xFFFF
+READY, PROCESS, CONFIGURE, QUIT, ERROR = 0, 1, 2, 3, 0xFFFF
 MAX_PAYLOAD = 1024 * 1024
+
+
+def is_finite_f32le(raw):
+    """Check only raw little-endian float32 words, without materializing floats.
+
+    IEEE NaN/Inf have all eight exponent bits set. The final per-byte low-bit
+    mask excludes cross-word shift bits and ignores the sign/mantissa. Framing
+    and descriptor validation remain the caller's responsibility.
+    """
+    if len(raw) % 4:
+        raise ValueError('Expected complete little-endian float32 words')
+    hi = int.from_bytes(raw[3::4], 'little')
+    lo = int.from_bytes(raw[2::4], 'little')
+    flags = hi
+    for shift in range(1, 7):
+        flags &= hi >> shift
+    flags &= lo >> 7
+    return not (flags & int.from_bytes(b'\x01' * (len(raw) // 4), 'little'))
 
 
 def encode(opcode, sequence, frames=0, channels=0, payload=b'', *, response=False):

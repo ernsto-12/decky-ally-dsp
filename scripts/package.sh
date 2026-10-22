@@ -7,6 +7,17 @@ VERSION="$(python3 -c "import json;print(json.load(open('package.json'))['versio
 [ -f dist/index.js ] || { echo "dist/index.js missing: run pnpm build" >&2; exit 1; }
 [ -d bin/lv2/lsp-plugins.lv2 ] || scripts/fetch-lsp.sh
 [ -f defaults/converter/dolby_to_pipewire.py ] || scripts/assemble-converter.sh
+# Original Dolby assets stay in the user's private engine generations.
+# The release exposes PCM processing only; game Spatial Audio is deferred.
+ALLYDSP_PLUGIN_DIR="$ROOT" PYTHONPATH="$ROOT/py_modules" python3 - <<'PY'
+from pathlib import Path
+import hashlib
+from allydsp.original_assets import PUBLIC_PINS
+root=Path('py_modules/allydsp/original')
+assert all(hashlib.sha256((root/name).read_bytes()).hexdigest()==digest for name,digest in PUBLIC_PINS.items())
+assert not Path('native').exists()
+assert not list(Path('py_modules/allydsp').glob('object_*.py'))
+PY
 rm -rf out; mkdir -p "out/$NAME/dist" "out/$NAME/defaults" "out/$NAME/bin" "out/$NAME/scripts"
 cp plugin.json package.json main.py decky.pyi LICENSE THIRD_PARTY_LICENSES.md README.md minisign.pub "out/$NAME/"
 cp dist/index.js "out/$NAME/dist/"; cp dist/index.js.map "out/$NAME/dist/" 2>/dev/null || true

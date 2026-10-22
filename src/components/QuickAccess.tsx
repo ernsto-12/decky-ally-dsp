@@ -16,6 +16,7 @@ import {
   checkForUpdate,
   installViaDecky,
   prepareUpdate,
+  prepareOriginalProfiles,
   setEngine,
   setEnabled,
   setExtras,
@@ -134,6 +135,7 @@ export function QuickAccess() {
   const engineKind = s.engine?.kind ?? s.settings.engine?.kind ?? "converted";
   const original = engineKind === "original";
   const originalAvailable = s.engine?.available === true;
+  const originalControlsAvailable = s.engine?.controlsAvailable === true || s.originalControls?.available === true;
   const originalLabel = s.engine?.engineLabel || t.engineOriginal;
   const engineOptions = [
     { data: "converted" as EngineKind, label: t.engineConverted },
@@ -147,7 +149,7 @@ export function QuickAccess() {
   const perApp = appId ? s.settings.perApp[appId] : undefined;
   const profileOptions = s.profiles.map((p) => ({ data: p.id, label: p.label }));
   const voicingOptions = s.voicings.map((v) => ({ data: v.id, label: v.label }));
-  const activeLabel = original ? originalLabel : s.dsp.active_preset?.profile
+  const activeLabel = original ? `${originalLabel}${originalControlsAvailable ? ` · ${labelOf(s.profiles, resolved.profile)} · ${labelOf(s.voicings, resolved.voicing)}` : ""}` : s.dsp.active_preset?.profile
     ? `${labelOf(s.profiles, s.dsp.active_preset.profile)} · ${labelOf(s.voicings, s.dsp.active_preset.voicing ?? "")}`
     : "–";
 
@@ -218,7 +220,7 @@ export function QuickAccess() {
     <>
       <PanelSection title={t.status}>
         <PanelSectionRow>
-          <Field label={statusText(s)} description={`${activeLabel}${!original && resolved.source === "app" ? ` · ${t.thisGame}` : ""}`} />
+          <Field label={statusText(s)} description={`${activeLabel}${(!original || originalControlsAvailable) && resolved.source === "app" ? ` · ${t.thisGame}` : ""}`} />
         </PanelSectionRow>
         {stale && (
           <PanelSectionRow>
@@ -252,7 +254,7 @@ export function QuickAccess() {
         {original && (
           <>
             <PanelSectionRow>
-              <Field label={originalLabel} description={t.engineFixedProfile} />
+              <Field label={originalLabel} description={originalControlsAvailable ? t.engineProfiles : t.engineFixedProfile} />
             </PanelSectionRow>
             {s.engine?.scope && (
               <PanelSectionRow>
@@ -263,6 +265,13 @@ export function QuickAccess() {
               <Field label={t.worker} description={!s.settings.enabled ? t.workerStopped : workerError
                 ? `${t.workerError}: ${workerError}` : workerReady ? t.workerReady : t.workerStarting} />
             </PanelSectionRow>
+            {!originalControlsAvailable && <PanelSectionRow>
+              <ButtonItem layout="below" disabled={engineBusy} description={t.dolbyPrepareDesc}
+                onClick={() => void run(async () => {
+                  const result = await prepareOriginalProfiles();
+                  if (!result.ok) throw new Error(result.state.error || t.dolbyUnavailable);
+                })}>{t.dolbyPrepare}</ButtonItem>
+            </PanelSectionRow>}
           </>
         )}
       </PanelSection>
@@ -282,7 +291,11 @@ export function QuickAccess() {
                   onChange={onOriginalGain} />
               </PanelSectionRow>
             )}
-            {!original && <>
+            {originalControlsAvailable && original && <PanelSectionRow>
+              <ButtonItem layout="below" description={t.dolbyControlsDesc} disabled={engineBusy}
+                onClick={() => goto("/ally-dsp/dolby")}>{t.dolbyControls}</ButtonItem>
+            </PanelSectionRow>}
+            {(!original || originalControlsAvailable) && <>
             <PanelSectionRow>
               <DropdownItem label={t.preset} rgOptions={profileOptions} selectedOption={s.settings.global.profile} disabled={busy}
                 onChange={(o) => void run(() => setGlobal(o.data, s.settings.global.voicing))} />
@@ -294,7 +307,7 @@ export function QuickAccess() {
             </>}
           </PanelSection>
 
-          {!original && <>
+          {(!original || originalControlsAvailable) && <>
           <PanelSection title={appId ? `${t.thisGame}: ${appName(appId)}` : t.thisGame}>
             {appId ? (
               <>
@@ -333,7 +346,9 @@ export function QuickAccess() {
               </>
             )}
           </PanelSection>
+          </>}
 
+          {!original && <>
           <PanelSection title={t.extras}>
             {s.setup.converting && s.setup.convertLast && (
               <PanelSectionRow>

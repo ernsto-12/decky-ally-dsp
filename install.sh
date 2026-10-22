@@ -26,8 +26,136 @@ resume_engine() {
   sudo -u "$DECK_USER" env HOME="$USER_HOME" DECKY_USER_HOME="$USER_HOME" DECKY_USER="$DECK_USER" \
     ALLYDSP_PLUGIN_DIR="$PLUGIN_BASE/$PLUGIN_NAME" PYTHONPATH="$PLUGIN_BASE/$PLUGIN_NAME/py_modules" \
     XDG_RUNTIME_DIR="/run/user/$DECK_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$DECK_UID/bus" \
-    python3 -c 'from allydsp import dsp_runtime; dsp_runtime.ensure_unit(); assert dsp_runtime.start(), "Audio engine failed to resume"'
+    python3 -c 'from allydsp import dsp_runtime
+bootstrap=getattr(dsp_runtime,"resume_after_install",None)
+if bootstrap:
+    result=bootstrap()
+else:
+    from allydsp import settings
+    state=settings.load(); deferred=not state.get("enabled")
+    if not deferred and state.get("engine",{}).get("kind")=="original":
+        from allydsp import original_runtime
+        health=getattr(original_runtime,"health",None)
+        deferred=health is None or health().get("reason")=="external-output-selected"
+    result=True if deferred else (dsp_runtime.ensure_unit(),dsp_runtime.start())[1]
+assert result, "Audio engine failed to resume"'
 }
+guard_object_audio_sessions() {
+  # Older releases have no object renderer. Query an installed renderer before
+  # stopping Decky or replacing any of its Python sources/private descriptors.
+  [ -f "$PLUGIN_BASE/$PLUGIN_NAME/py_modules/allydsp/object_service.py" ] || return 0
+  sudo -u "$DECK_USER" env HOME="$USER_HOME" DECKY_USER_HOME="$USER_HOME" DECKY_USER="$DECK_USER" \
+    ALLYDSP_PLUGIN_DIR="$PLUGIN_BASE/$PLUGIN_NAME" PYTHONPATH="$PLUGIN_BASE/$PLUGIN_NAME/py_modules" \
+    XDG_RUNTIME_DIR="/run/user/$DECK_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$DECK_UID/bus" \
+    python3 -c 'from allydsp import object_service
+if object_service.active_units():
+    raise SystemExit("Exit object-audio games before updating")'
+}
+acquire_object_update_lock() {
+  # A user-owned helper holds the exclusive lock while this shell mutates or
+  # rolls back. Root never opens/creates a path inside a user-controlled tree.
+  coproc ALLY_OBJECT_UPDATE_LOCK {
+    sudo -u "$DECK_USER" env HOME="$USER_HOME" python3 -c '
+import fcntl,os,pathlib,stat,sys
+root=pathlib.Path(sys.argv[1])
+if not root.is_absolute() or any(path.is_symlink() for path in (root,*root.parents)):
+    raise SystemExit("Unsafe object launch/update directory")
+root.mkdir(parents=True,exist_ok=True,mode=0o700)
+if not root.is_dir() or root.stat().st_uid!=os.getuid():
+    raise SystemExit("Object launch/update directory has another owner")
+os.chmod(root,0o700)
+path=root/".launch-update.lock"
+fd=os.open(path,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+info=os.fstat(fd);named=path.lstat()
+if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or (info.st_dev,info.st_ino)!=(named.st_dev,named.st_ino):
+    raise SystemExit("Object launch/update lock changed")
+os.fchmod(fd,0o600)
+try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+except BlockingIOError: raise SystemExit("Exit object-audio games before updating; a game launch is in progress")
+print("LOCKED",flush=True)
+sys.stdin.buffer.read(1)
+' "$USER_HOME/homebrew/data/$PLUGIN_NAME/original/objects"
+  }
+  OBJECT_LOCK_PID="${ALLY_OBJECT_UPDATE_LOCK_PID:-}"
+  OBJECT_LOCK_WRITE="${ALLY_OBJECT_UPDATE_LOCK[1]:-}"
+  OBJECT_LOCK_READ="${ALLY_OBJECT_UPDATE_LOCK[0]:-}"
+  local lock_result=""
+  if [ -z "$OBJECT_LOCK_READ" ] || ! IFS= read -r -u "$OBJECT_LOCK_READ" lock_result || [ "$lock_result" != LOCKED ]; then
+    echo "Could not acquire the object launch/update lock; retry after exiting games." >&2
+    return 1
+  fi
+}
+original_descriptor_state() {
+  # These three small descriptors select an immutable private generation. Keep
+  # every generation; restore the old descriptors before resuming an old plugin.
+  python3 - "$1" "$USER_HOME/homebrew/data/$PLUGIN_NAME/original" "$BACKUP/original-descriptors" <<'ORIGINAL_STATE'
+import hashlib,json,os,pathlib,stat,sys,tempfile
+action=sys.argv[1];root=pathlib.Path(sys.argv[2]);backup=pathlib.Path(sys.argv[3])
+names=('active.json','controls.json','engine.json')
+limit=4*1024*1024
+def regular(path):
+    info=path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_size>limit:
+        raise RuntimeError('Expected a bounded regular original-engine descriptor: '+path.name)
+    fd=os.open(path,os.O_RDONLY|getattr(os,'O_NOFOLLOW',0))
+    with os.fdopen(fd,'rb') as stream:
+        opened=os.fstat(stream.fileno())
+        if (opened.st_dev,opened.st_ino)!=(info.st_dev,info.st_ino):raise RuntimeError('Descriptor changed while opening')
+        data=stream.read(limit+1)
+    if len(data)!=info.st_size:raise RuntimeError('Descriptor changed while reading')
+    return data,info
+def safe_root():
+    if any(path.is_symlink()for path in(root,*root.parents)):
+        raise RuntimeError('Original-engine descriptor directory contains a symbolic link')
+    if root.exists()and not root.is_dir():raise RuntimeError('Original-engine descriptor directory is not a directory')
+safe_root()
+if action=='backup':
+    backup.mkdir(mode=0o700,exist_ok=False)
+    records=[]
+    for name in names:
+        source=root/name
+        try:data,info=regular(source)
+        except FileNotFoundError:
+            records.append({'name':name,'present':False});continue
+        target=backup/name
+        with target.open('xb')as stream:stream.write(data);stream.flush();os.fsync(stream.fileno())
+        os.chmod(target,0o600)
+        records.append({'name':name,'present':True,'sha256':hashlib.sha256(data).hexdigest(),
+                        'mode':stat.S_IMODE(info.st_mode),'uid':info.st_uid,'gid':info.st_gid,
+                        'atime_ns':info.st_atime_ns,'mtime_ns':info.st_mtime_ns})
+    metadata=backup/'snapshot.json'
+    with metadata.open('x')as stream:json.dump({'schema':1,'records':records},stream);stream.flush();os.fsync(stream.fileno())
+    os.chmod(metadata,0o600)
+elif action=='restore':
+    raw,_=regular(backup/'snapshot.json');snapshot=json.loads(raw)
+    records=snapshot['records']
+    if snapshot.get('schema')!=1 or [record['name']for record in records]!=list(names):raise RuntimeError('Invalid descriptor snapshot')
+    # Validate the complete snapshot before changing any descriptor.
+    payloads={}
+    for record in records:
+        if record['present']:
+            data,_=regular(backup/record['name'])
+            if hashlib.sha256(data).hexdigest()!=record['sha256']:raise RuntimeError('Descriptor snapshot digest differs')
+            payloads[record['name']]=data
+    if payloads:root.mkdir(mode=0o700,parents=True,exist_ok=True)
+    for record in records:
+        target=root/record['name']
+        if target.is_symlink()or(target.exists()and not target.is_file()):raise RuntimeError('Unsafe original-engine descriptor destination')
+    for record in records:
+        target=root/record['name']
+        if not record['present']:
+            target.unlink(missing_ok=True);continue
+        fd,temporary=tempfile.mkstemp(prefix='.installer-restore-',dir=root)
+        try:
+            with os.fdopen(fd,'wb')as stream:stream.write(payloads[record['name']]);stream.flush();os.fsync(stream.fileno())
+            os.chmod(temporary,record['mode']);os.chown(temporary,record['uid'],record['gid'])
+            os.utime(temporary,ns=(record['atime_ns'],record['mtime_ns']));os.replace(temporary,target)
+        finally:
+            if os.path.exists(temporary):os.unlink(temporary)
+else:raise RuntimeError('Unknown descriptor transaction action')
+ORIGINAL_STATE
+}
+guard_object_audio_sessions
 TMP="$(mktemp -d)"
 STAGE=""
 BACKUP=""
@@ -35,6 +163,10 @@ MUTATING=0
 LOADER_ACTIVE=0
 DSP_ACTIVE=0
 REPLACED=0
+DESCRIPTORS_SNAPSHOTTED=0
+OBJECT_LOCK_PID=""
+OBJECT_LOCK_READ=""
+OBJECT_LOCK_WRITE=""
 cleanup() {
   rc=$?
   trap - EXIT
@@ -54,12 +186,20 @@ cleanup() {
     if [ -f "$BACKUP/ally-dsp.service" ]; then
       cp -a -- "$BACKUP/ally-dsp.service" "$USER_HOME/.config/systemd/user/ally-dsp.service"
     fi
+    DESCRIPTORS_RESTORED=1
+    if [ "$DESCRIPTORS_SNAPSHOTTED" = 1 ]; then
+      original_descriptor_state restore || { DESCRIPTORS_RESTORED=0; echo "Original-engine descriptors could not be restored; inspect $BACKUP/original-descriptors before starting audio." >&2; }
+    fi
     user_systemctl daemon-reload || true
-    [ "$DSP_ACTIVE" != 1 ] || resume_engine || echo "The previous audio engine could not resume; inspect the saved backup." >&2
+    [ "$DSP_ACTIVE" != 1 ] || [ "$DESCRIPTORS_RESTORED" != 1 ] || resume_engine || echo "The previous audio engine could not resume; inspect the saved backup." >&2
     [ "$LOADER_ACTIVE" != 1 ] || systemctl start plugin_loader || true
   fi
   [ -z "$STAGE" ] || rm -rf -- "$STAGE"
   rm -rf -- "$TMP"
+  # Release only after successful installation or complete rollback/cleanup.
+  [ -z "$OBJECT_LOCK_WRITE" ] || exec {OBJECT_LOCK_WRITE}>&-
+  [ -z "$OBJECT_LOCK_READ" ] || exec {OBJECT_LOCK_READ}<&-
+  [ -z "$OBJECT_LOCK_PID" ] || wait "$OBJECT_LOCK_PID" || true
   exit "$rc"
 }
 trap cleanup EXIT
@@ -109,6 +249,9 @@ PY
 STAGE="$(mktemp -d "$PLUGIN_BASE/.ally-dsp-stage.XXXXXXXX")"
 cp -a -- "$TMP/x/$PLUGIN_NAME/." "$STAGE/"
 chown -R "$DECK_USER:$DECK_USER" "$STAGE"
+# A game may have started while this release was downloaded and verified.
+acquire_object_update_lock
+guard_object_audio_sessions
 mkdir -p "$USER_HOME/homebrew/ally-dsp-backups"
 BACKUP="$(mktemp -d "$USER_HOME/homebrew/ally-dsp-backups/$(date -u +%Y%m%dT%H%M%SZ).XXXXXXXX")"
 chmod 700 "$BACKUP"
@@ -123,6 +266,8 @@ MUTATING=1
 # the jack watcher cannot restart the old chain while files are moved.
 [ "$LOADER_ACTIVE" != 1 ] || systemctl stop plugin_loader
 if [ -f "$UNIT" ] || [ "$DSP_ACTIVE" = 1 ]; then user_systemctl stop ally-dsp.service; fi
+original_descriptor_state backup
+DESCRIPTORS_SNAPSHOTTED=1
 [ ! -e "$PLUGIN_BASE/$PLUGIN_NAME" ] || mv -- "$PLUGIN_BASE/$PLUGIN_NAME" "$BACKUP/plugin"
 mv -- "$STAGE" "$PLUGIN_BASE/$PLUGIN_NAME"
 STAGE=""

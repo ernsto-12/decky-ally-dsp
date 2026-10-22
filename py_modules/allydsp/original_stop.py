@@ -38,7 +38,7 @@ def _private_prefix_plan():
     manifest_hash = runtime._hash_file(runtime.ENGINE_FILE)
     runtime_hash = runtime._hash_file(runtime.RUNTIME_FILE)
     config, active = read_json(runtime.ENGINE_FILE), read_json(runtime.RUNTIME_FILE)
-    if not isinstance(config, dict) or config.get("schema") != "ally-dsp-original-engine-v1":
+    if not isinstance(config, dict) or config.get("schema") not in ("ally-dsp-original-engine-v1", "ally-dsp-original-engine-v2"):
         raise RuntimeError("Original stop manifest is unavailable")
     generation = config.get("generation")
     if (not isinstance(generation, str) or len(generation) != 64
@@ -50,6 +50,20 @@ def _private_prefix_plan():
     profiles = config.get("profiles")
     selected = profiles.get(active.get("engine_profile")) if isinstance(profiles, dict) else None
     worker = selected.get("worker") if isinstance(selected, dict) else None
+    if isinstance(worker, dict) and config.get("schema") == "ally-dsp-original-engine-v2":
+        actual = active.get("worker")
+        if isinstance(actual, dict) and isinstance(actual.get("command"), list):
+            command = list(worker.get("command", []))
+            for flag, allowed in (("--preset", config.get("supported_presets", [])),
+                                  ("--voicing", config.get("supported_voicings", []))):
+                active_command = actual["command"]
+                if command.count(flag) != 1 or active_command.count(flag) != 1:
+                    raise RuntimeError("Original stop profile launch parameter is invalid")
+                index = command.index(flag)
+                if len(active_command) <= index + 1 or active_command[index] != flag or active_command[index + 1] not in allowed:
+                    raise RuntimeError("Original stop profile selection is invalid")
+                command[index + 1] = active_command[index + 1]
+            worker = dict(worker, command=command)
     if not isinstance(worker, dict) or active.get("worker") != worker:
         raise RuntimeError("Original stop runtime and current generation disagree")
     target = _plain_path(original / "assets" / generation)

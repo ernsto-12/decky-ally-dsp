@@ -40,12 +40,38 @@ export interface EngineState {
   error?: string | null;
   engineLabel?: string | null;
   scope?: string | null;
+  controlsAvailable?: boolean;
+  supportedPresets?: string[];
+}
+
+export interface OriginalControls {
+  eqEnabled?: boolean;
+  eqBandsDb?: number[];
+  ieqEnabled?: boolean;
+  ieqAmount?: number;
+  dialogEnabled?: boolean;
+  dialogAmount?: number;
+  volumeLevelerEnabled?: boolean;
+  volumeLevelerAmount?: number;
+  spatialEnabled?: boolean;
+}
+
+export interface OriginalControlsState {
+  available: boolean;
+  overrides: OriginalControls;
+  effective: OriginalControls;
+  official: OriginalControls;
+  frequencies: number[];
+  preset?: string;
+  voicing?: string;
+  route?: string;
+  error?: string | null;
 }
 
 export interface Settings {
   enabled: boolean;
   engine?: { kind: EngineKind };
-  original?: { outputGainDb?: number };
+  original?: { outputGainDb?: number; controls?: OriginalControls };
   global: { profile: string; voicing: string };
   perApp: Record<string, PerAppEntry>;
   extras: Extras;
@@ -94,6 +120,7 @@ export interface UpdateInfo {
 export interface PluginState {
   version: string;
   engine?: EngineState;
+  originalControls?: OriginalControlsState;
   setup: Settings["setup"] & {
     xmlPresent: boolean;
     venvOk: boolean;

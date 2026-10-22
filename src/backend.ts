@@ -1,5 +1,5 @@
 import { callable } from "@decky/api";
-import type { DspState, EngineKind, EngineState, Extras, PerAppEntry, PluginState, SetupProgress, UpdateArtifact, UpdateInfo } from "./types";
+import type { DspState, EngineKind, EngineState, Extras, OriginalControls, OriginalControlsState, PerAppEntry, PluginState, SetupProgress, UpdateArtifact, UpdateInfo } from "./types";
 
 export const getState = callable<[], PluginState>("get_state");
 export const runSetup = callable<[force: boolean, allowUnsupported: boolean], { started: boolean; reason?: string }>("run_setup");
@@ -11,6 +11,9 @@ export const onRunningAppChanged = callable<[appId: string | null], { appId: str
 export const setEnabled = callable<[enabled: boolean], DspState>("set_enabled");
 export const setEngine = callable<[kind: EngineKind], { ok: boolean; engine: EngineState }>("set_engine");
 export const setOriginalGain = callable<[gain_db: number], { ok: boolean; outputGainDb: number; applied: boolean }>("set_original_gain");
+export const getOriginalControls = callable<[], OriginalControlsState>("get_original_controls");
+export const setOriginalControls = callable<[overrides: OriginalControls], { ok: boolean; applied: boolean; state: OriginalControlsState }>("set_original_controls");
+export const prepareOriginalProfiles = callable<[], { ok: boolean; state: OriginalControlsState }>("prepare_original_profiles");
 export const setExtras = callable<[extras: Partial<Extras>], { ok: boolean; extras: Extras; reconverting: boolean }>("set_extras");
 export const checkForUpdate = callable<[force: boolean], UpdateInfo>("check_for_update");
 export const prepareUpdate = callable<[], UpdateArtifact>("prepare_update");

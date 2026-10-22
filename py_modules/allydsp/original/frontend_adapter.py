@@ -53,7 +53,7 @@ class HrtfFrontendAdapter:
  SetAudioObject, MetadataGenerate and IDAPModule2 EncodeAudioData path. No live
  endpoint registration and no writes to original private state.
  """
- def __init__(self,access_dll,hrtf_dll,init_blob,initial_runtime_blob,mode=0,static_mask=0x3fffe):
+ def __init__(self,access_dll,hrtf_dll,init_blob,initial_runtime_blob,mode=0,static_mask=0x3fffe,object_mapper=False):
   from types import SimpleNamespace
   a=SimpleNamespace(dll=pathlib.Path(access_dll),hrtf=pathlib.Path(hrtf_dll),init_blob=pathlib.Path(init_blob),runtime_blob=pathlib.Path(initial_runtime_blob),initial_runtime_blob=pathlib.Path(initial_runtime_blob),mode=mode,static_mask=static_mask,object_type=None)
   assert sha(a.dll.read_bytes())==PIN
@@ -113,10 +113,18 @@ class HrtfFrontendAdapter:
   personality=guid('1459ac38-3875-49bf-bb59-0fe80f4d395d' if a.mode==0 else '4c81e564-c8ef-4ad9-9f2c-9ef995533790')
   initialize=CALL(HR,PTR,PTR,PTR,PTR,PTR,U32,U32,U32,U32,U32,PTR,PTR,PTR,PTR)(hrtf._handle+0x5c40)
   emit('before-original-Hrtf-RuntimeClassInitialize',object_type=None,logger_offset='0xe8')
-  hr=initialize(engine,personality,None,processing,None,256,48000,a.static_mask,2,3,None,logger,None,initdata)
+  # Object transport opts into the original factory-created position mapper.
+  # The established PCM path keeps its original null mapper and call arguments.
+  position_factory=PTR();position_mapper=PTR()
+  if object_mapper:
+   hr=CALL(HR,PTR)(hrtf._handle+0xc010)(C.byref(position_factory));assert hr==0 and position_factory.value
+   hr=meth(position_factory.value,3,HR,PTR,PTR)(position_factory,personality,C.byref(position_mapper));assert hr==0 and position_mapper.value
+  hr=initialize(engine,personality,None,processing,None,256,48000,a.static_mask,2,3,position_mapper if object_mapper else None,logger,None,initdata)
   emit('after-original-Hrtf-RuntimeClassInitialize',hresult=hex(hr&0xffffffff))
   assert hr==0
   self.keep=[references,exception_callback,combase,dll,hrtf,enginebuf,pluginbuf,props,user,fx,device,coll,initdata,personality,factory,instance]
+  if object_mapper:self.keep.extend((position_factory,position_mapper))
+  self.object_mapper=bool(object_mapper);self.previous_objects={}
   self.processing=processing;self.engine=engine;self.module=getptr(processing+0x538);self.dsp=getptr(self.module+0x60)
   self.dll=dll;self.hrtf=hrtf;self.mode=a.mode;self.user=user;self.device=device;self.audit=audit
   self.engine_guard=enginebuf;self.plugin_guard=pluginbuf
@@ -128,6 +136,7 @@ class HrtfFrontendAdapter:
   self.frame_index=0;self.timings=[];self.metadata_snapshots=[]
   self.configuration=list((U32*8).from_address(engine+0x48))
   self.initialization={'hresult':hex(hr&0xffffffff),'configuration_u32':self.configuration,'core_initialization_readback':{name:U32.from_address(self.dsp+off).value for name,off in [('sample_rate',0),('mi_process_disable',4),('virtual_bass_process_enable',8),('mode',12),('max_num_objects',16),('max_num_bypass_objects',20)]},'com_audit':audit,'initial_user_property_queries':list(user.audit)}
+  if object_mapper and not getptr(engine+0x2c990):raise RuntimeError('Original position mapper was not initialized')
  def notify(self,blob):
   out=PTR();hr=meth(self.processing,0,HR,PTR,PTR)(self.processing,guid('56b0c76f-02fd-4b21-a52e-9f8219fc86e4'),C.byref(out));assert hr==0
   key=key_bytes('1b4dab55-b1fb-4d8c-8317-f2d4a96efbb8',2 if self.mode==0 else 5)
@@ -161,6 +170,33 @@ class HrtfFrontendAdapter:
   self.frame_index+=1
   return C.string_at(self.stereo.pointer,2048)
 
+ def process_objects(self,objects):
+  """Submit one validated source batch, then call the original Encode once.
+
+  All descriptors and mono planes are caller-owned. Dynamic XYZ is supplied
+  only for type 1; static channels, including LFE, retain their native type.
+  """
+  if not self.object_mapper:raise RuntimeError('Object processing requires the original position mapper')
+  start=time.perf_counter();current={}
+  for item in objects:
+   identifier,kind=item['id'],item['type'];current[identifier]=kind
+   if identifier in self.previous_objects and self.previous_objects[identifier]!=kind:raise ValueError('An active object changed type')
+   data=item['samples'].tobytes()
+   if len(data)!=1024:raise ValueError('Expected one mono object block')
+   flags=2|(4 if kind==1 else 0)|(1 if identifier not in self.previous_objects else 0)
+   descriptor=struct.pack('<4I4f',identifier,0,kind,flags,*item['position'],item['gain'])
+   C.memmove(self.mono.pointer,data,1024);C.memmove(self.spec.pointer,descriptor,32)
+   hr=self.setobject(self.engine,self.spec.pointer,self.mono.pointer,256,1.0)
+   if hr!=0:raise RuntimeError('Original SetAudioObject failed: '+hex(hr&0xffffffff))
+   if not self.mono.check() or not self.spec.check() or C.string_at(self.mono.pointer,1024)!=data or C.string_at(self.spec.pointer,32)!=descriptor:raise RuntimeError('Original object input guard changed')
+  written=U32();hr=self.process_original(self.engine,2048,self.stereo.pointer,C.byref(written))
+  if hr!=0 or written.value!=2048:raise RuntimeError('Original object Encode output differs')
+  self.timings.append(time.perf_counter()-start)
+  if not self.stereo.check() or not self.engine_guard.check() or not self.plugin_guard.check():raise RuntimeError('Original object output guard changed')
+  if getptr(self.processing+0x538)!=self.module or getptr(self.module+0x60)!=self.dsp:raise RuntimeError('Original object DSP identity changed')
+  self.previous_objects=current;self.frame_index+=1
+  return C.string_at(self.stereo.pointer,2048)
+
  def state_readback(self):
   return {'requested_processing_mode':U32.from_address(self.dsp+0x118).value,'applied_processing_mode':U32.from_address(self.dsp+0x11c).value,'requested_matrix_enable':U32.from_address(self.dsp+0x128).value,'applied_matrix_enable':U32.from_address(self.dsp+0x12c).value,'requested_matrix_output_channels':U32.from_address(self.dsp+0x120).value,'applied_matrix_output_channels':U32.from_address(self.dsp+0x124).value,'module_initialized':C.c_uint8.from_address(self.module+0x68).value,'default_headphone_tuning_initialized':C.c_uint8.from_address(self.module+0x69).value,'core_mode':U32.from_address(self.dsp+0xc).value,'sample_rate':U32.from_address(self.dsp).value,'max_num_objects':U32.from_address(self.dsp+0x10).value,'max_num_bypass_objects':U32.from_address(self.dsp+0x14).value}
 
@@ -170,10 +206,10 @@ class PcmFrontendAdapter:
  Windows WAVE-order 6/8-channel PCM is assigned to original static audio
  objects. Atmos object metadata absent from PCM cannot be reconstructed.
  """
- def __init__(self,dll,hrtf,init_blob,initial_runtime_blob,input_channels=6,mode=0,runtime_blob=None):
+ def __init__(self,dll,hrtf,init_blob,initial_runtime_blob,input_channels=6,mode=0,runtime_blob=None,object_mapper=False):
   assert input_channels in(1,2,6,8)
   self.layout={1:[2],2:[2,4],6:[2,4,8,16,128,256],8:[2,4,8,16,128,256,32,64]}[input_channels]
-  self.engine=HrtfFrontendAdapter(dll,hrtf,init_blob,initial_runtime_blob,mode)
+  self.engine=HrtfFrontendAdapter(dll,hrtf,init_blob,initial_runtime_blob,mode,object_mapper=object_mapper)
   self.notification=self.engine.notify(pathlib.Path(runtime_blob).read_bytes())if runtime_blob else None
   self.metadata={'block_frames':256,'sample_rate':48000,'input_channels':input_channels,'output_channels':2,'format':'float32le-interleaved','engine':'original-hrtf-frontend','mode':mode,'static_audio_object_layout':self.layout,'full_frontend':True,'runtime_notification':self.notification}
   self.blocks=0

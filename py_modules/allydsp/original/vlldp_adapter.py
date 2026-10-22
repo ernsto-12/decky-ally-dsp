@@ -10,12 +10,16 @@ import ctypes as C
 import hashlib
 import importlib.util
 import json
-import math
 from pathlib import Path
 import struct
 import threading
 import time
 import uuid
+
+try:
+    from .protocol import is_finite_f32le
+except ImportError:
+    from protocol import is_finite_f32le
 
 
 DLL_SHA256 = "28990e8d5845b012020b52947ceab0cf37199ede1e8162cd7d7a03db580af82c"
@@ -168,7 +172,7 @@ class VlldpStreamAdapter:
     def process(self, payload):
         if self.closed or threading.get_ident() != self._thread:
             raise RuntimeError("An open VLLDP stream must stay on its owning thread")
-        if len(payload) != 2048 or any(not math.isfinite(v) for (v,) in struct.iter_unpack("<f", payload)):
+        if len(payload) != 2048 or not is_finite_f32le(payload):
             raise ValueError("Expected 256 finite little-endian float32 stereo frames")
         with self._lock:
             self._check()
@@ -179,7 +183,7 @@ class VlldpStreamAdapter:
             duration = time.perf_counter_ns() - start
             self._check()
             raw = C.string_at(self.output.pointer, 2048)
-            if any(not math.isfinite(v) for (v,) in struct.iter_unpack("<f", raw)):
+            if not is_finite_f32le(raw):
                 raise RuntimeError("Nonfinite original VLLDP output")
             self.blocks += 1
             self.processing_ns += duration

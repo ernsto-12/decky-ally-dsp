@@ -10,7 +10,7 @@ import signal
 import subprocess
 import time
 
-from protocol import HEADER, READY, PROCESS, QUIT, ERROR, encode, decode_header
+from protocol import HEADER, READY, PROCESS, CONFIGURE, QUIT, ERROR, encode, decode_header, json_bytes
 
 
 class StreamWorker:
@@ -84,6 +84,27 @@ class StreamWorker:
                 or len(output) != self.frames * self.output_channels * 4):
             raise RuntimeError('PCM response differs from negotiated block/sequence')
         return output
+
+    def configure(self, controls, *, preset=None, voicing=None):
+        if self.closed or self.metadata.get('runtime_controls') is not True:
+            raise RuntimeError('This imported engine does not support runtime controls')
+        request = {'schema': 'ally-dsp-original-controls-v1', 'controls': controls}
+        if preset is not None:
+            request['preset'] = preset
+        if voicing is not None:
+            request['voicing'] = voicing
+        payload = json_bytes(request)
+        self.sequence += 1
+        self._io(self._input, encode(CONFIGURE, self.sequence, payload=payload),
+                 time.monotonic() + self.block_timeout, write=True)
+        header, raw = self._read_packet(self.block_timeout)
+        if (header['opcode'] != CONFIGURE or header['sequence'] != self.sequence
+                or header['frames'] or header['channels']):
+            raise RuntimeError('Control response differs from the request')
+        result = json.loads(raw)
+        if result.get('applied') is not True:
+            raise RuntimeError('Original receiver did not apply the control update')
+        return result
 
     def close(self):
         if self.closed:

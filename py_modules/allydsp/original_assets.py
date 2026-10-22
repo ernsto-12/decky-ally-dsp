@@ -69,15 +69,19 @@ PYTHON_PINS = {
 }
 # Updated as a unit with the public original-engine worker bundle.
 PUBLIC_PINS = {
-    "frontend_adapter.py": "265d63f39de0b43fdef6096803107599d527b58a63596e861ab63f2ef749e0f3",
-    "hrtf_adapter.py": "24cefd10d90d04d644663d7cc2d7d31eaa627b71af06be63496cd078c7167580",
-    "linux_client.py": "4d5a22c6b4892ac0b1b787330548987e91a2f68ff3152e7d859818d1f76bfa62",
+    "frontend_adapter.py": "57a8c5203050a666cbb0cfdf8079acff56aa48fab0277beaf5fc1adbc0294c78",
+    "hrtf_adapter.py": "8ecc1cdc2300a8aa08496b4aa12c937763d60ff062f72cee302c9575bcd039be",
+    "linux_client.py": "cbd858f085a298a9ebc2338f3986b6d5333804d1df41f2a572e79abe3d4d905a",
     "local_property_store.py": "f5cfc1d90ce8c58ab70bf700a941645bed340ed4f54b31a41d4800473877c0b4",
-    "pipewire_bridge.py": "e8179c62b0c0315f4aa196ad39bc2ac1b01a710fb2a4a4034c0e21f364c86472",
+    "object_engine.py": "b1c7cb332e2d8d52346bd7ecf8f380aee4fb8d08cc9b7674da7561b251bf801e",
+    "object_protocol.py": "4bea4aeb9cdb49a6f655dca5d7e0b77a610f3395b78475cc2297857fc261d04d",
+    "object_worker.py": "ec134b61cdd8b49d0b3d26babf0ee55802ba7bc1042c49e894b0376f77bad1fd",
+    "pipewire_bridge.py": "11ec349ef114d470a31e0c1285520bbb6695bd3d523cf578a8534cbb74775493",
     "pipewire_graph.py": "78c77c460ffddaf24a423e220b5c3e4b431a22327ca9d6fcfa513899150ee93e",
-    "protocol.py": "d4f6c7e0f48e3ae0396783cd91c6732f23a91966f15358a4713c2a614e76ccc4",
-    "vlldp_adapter.py": "e2c6c7c2a8acdcaa87f00598a52635ff786d52944f1858f7e4514ba3b600ee6e",
-    "windows_worker.py": "e91131019bfb372c47c81fb57fd043b4ed22c4195a793aeb987e0d323bb23a30"
+    "protocol.py": "a321f5012c44f4e1c039fb1f2c2416d71b2f1305ad8390f32e16870bafb3c46a",
+    "runtime_controls.py": "3afea7b3d1ff202bb60a5b526f79b1c1090bee1cf00485d16823a50adf6628cb",
+    "vlldp_adapter.py": "a8ef19e62e00bf7fd33357c302cac9ca124fbe05011d79ecf8904ebcf608d2b4",
+    "windows_worker.py": "b48b3ecb8d3df2837c83a396fa80a4e43cd2e5a6f0d850f334f96f01994736ca"
 }
 
 LABEL = "Original Dolby / Auto Game"
@@ -193,7 +197,9 @@ def _verify_generation(target: Path, pins: Dict[str, str]):
 def import_engine(source_dir: os.PathLike, python_dir: os.PathLike, proton: os.PathLike,
                   *, steam_dir: Optional[os.PathLike] = None,
                   runtime_dir: Optional[os.PathLike] = None,
-                  public_dir: Optional[os.PathLike] = None) -> Dict[str, Any]:
+                  public_dir: Optional[os.PathLike] = None,
+                  speaker_xml: Optional[os.PathLike] = None,
+                  headphone_xml: Optional[os.PathLike] = None) -> Dict[str, Any]:
     """Validate local inputs, preserve immutable generations, commit manifest last.
 
     source_dir is a flat private pack containing the DLLs, source settings and
@@ -212,9 +218,26 @@ def import_engine(source_dir: os.PathLike, python_dir: os.PathLike, proton: os.P
     vendor_files = _verified_files(source, VENDOR_PINS)
     python_files = _verified_files(python, PYTHON_PINS)
     public_files = _verified_files(public, PUBLIC_PINS)
+    if (speaker_xml is None) != (headphone_xml is None):
+        raise AssetError("Both official speaker and headphone XML sources are required")
+    profile_pack = None
+    if speaker_xml is not None:
+        from .original_profiles import build_profile_pack
+        try:
+            profile_pack = build_profile_pack(speaker_xml, headphone_xml,
+                                              source / "speaker-game-vlldp-plan.json")
+        except (ValueError, KeyError, OSError) as error:
+            raise AssetError("Cannot build the verified original profile catalog: " + str(error)) from error
     payloads = {**{"original/" + name: data for name, data in vendor_files.items()},
                 **{"python-embed/" + name: data for name, data in python_files.items()},
                 **{"worker/" + name: data for name, data in public_files.items()}}
+    if profile_pack is not None:
+        for name, data in profile_pack["payloads"].items():
+            parts = name.split("/")
+            if (not parts or any(part in ("", ".", "..") for part in parts)
+                    or "\\" in name or ":" in name or not isinstance(data, bytes)):
+                raise AssetError("Invalid private profile payload path or value")
+            payloads["original/profiles/" + name] = data
     file_pins = {name: _hash(data) for name, data in sorted(payloads.items())}
     generation = _hash(json.dumps(file_pins, sort_keys=True, separators=(",", ":")).encode())
     original = _absolute(runtime_dir or paths.RUNTIME_DIR, "Runtime directory") / "original"
@@ -283,14 +306,31 @@ def import_engine(source_dir: os.PathLike, python_dir: os.PathLike, proton: os.P
             "speakers": {"label": SPEAKER_LABEL, "scope": SPEAKER_SCOPE,
                          "profile": "game", "voicing": "official-speakers", "worker": speaker_worker},
         }
+        profile_catalog = None
+        if profile_pack is not None:
+            catalog_path = target / "original/profiles/catalog.json"
+            profile_catalog = {"path": str(catalog_path),
+                               "sha256": file_pins["original/profiles/catalog.json"]}
+            for worker in (headphone_worker, speaker_worker):
+                worker["command"].extend([
+                    "--profile-catalog", _windows_path(catalog_path),
+                    "--profile-catalog-sha256", profile_catalog["sha256"],
+                    "--preset", "game", "--voicing", "balanced",
+                ])
+            for profile in profiles.values():
+                profile["voicing"] = "balanced"
         files = [{"path": str(target / name), "sha256": expected} for name, expected in file_pins.items()]
         # Linux-side bridge/client imports are read from the installed plugin.
         files.extend({"path": str(public / name), "sha256": expected} for name, expected in PUBLIC_PINS.items())
         files.append({"path": str(proton_path), "sha256": _hash(proton_data)})
-        config = {"schema": "ally-dsp-original-engine-v1", "generation": generation,
+        config = {"schema": "ally-dsp-original-engine-v2" if profile_pack is not None else "ally-dsp-original-engine-v1", "generation": generation,
                   "sample_rate": 48000, "input_channels": 6, "output_channels": 2,
                   "files": files, "worker": headphone_worker, "profiles": profiles,
                   "label": LABEL, "scope": SCOPE, "profile": "game", "voicing": "official-headphones"}
+        if profile_catalog is not None:
+            config.update(profile_catalog=profile_catalog, voicing="balanced",
+                          supported_presets=list(profile_pack["catalog"]["presets"]),
+                          supported_voicings=list(profile_pack["catalog"]["voicings"]))
         atomic_write_text(str(manifest_path), json.dumps(config, ensure_ascii=False, indent=2) + "\n", mode=0o600)
         return {"ok": True, "generation": generation, "manifest": str(manifest_path),
                 "files": len(files), "label": LABEL, "scope": SCOPE, "profiles": list(profiles)}
@@ -300,3 +340,84 @@ def import_engine(source_dir: os.PathLike, python_dir: os.PathLike, proton: os.P
             # generation, prefix, source pack or caller-supplied path.
             if staging.parent.resolve() == assets_root.resolve() and staging.name.startswith(".import-") and not staging.is_symlink():
                 shutil.rmtree(staging)
+
+
+def upgrade_engine_profiles(*, speaker_xml: Optional[os.PathLike] = None,
+                            headphone_xml: Optional[os.PathLike] = None,
+                            runtime_dir: Optional[os.PathLike] = None,
+                            public_dir: Optional[os.PathLike] = None,
+                            allow_download: bool = True) -> Dict[str, Any]:
+    """Build a new immutable generation using the already imported private assets.
+
+    Call while the original engine is stopped and under the backend's engine
+    lock. This does not stop/start services, modify settings, download DLLs or
+    mutate the previous generation. The manifest is committed last by import.
+    Installed public files may have been updated; the old generation's frozen
+    vendor/Python/worker copies must still match their recorded file digests.
+    """
+    original = _absolute(runtime_dir or paths.RUNTIME_DIR, "Runtime directory") / "original"
+    if any(candidate.is_symlink() for candidate in (original, *original.parents)):
+        raise AssetError("Private engine source contains a symbolic link")
+    manifest = original / "engine.json"
+    try:
+        config = json.loads(_regular_file(manifest).decode("utf-8"))
+    except (ValueError, UnicodeError) as error:
+        raise AssetError("Cannot read the existing original engine manifest") from error
+    if config.get("schema") not in ("ally-dsp-original-engine-v1", "ally-dsp-original-engine-v2"):
+        raise AssetError("Unknown existing original engine manifest")
+    generation = config.get("generation")
+    if (not isinstance(generation, str) or len(generation) != 64
+            or any(character not in "0123456789abcdef" for character in generation)):
+        raise AssetError("Invalid existing private engine generation")
+    target = original / "assets" / generation
+    if any(candidate.is_symlink() for candidate in (target, target.parent)):
+        raise AssetError("Private engine generation contains a symbolic link")
+    target = _directory(target, "Existing private generation")
+    records = config.get("files")
+    if not isinstance(records, list) or len(records) > 256:
+        raise AssetError("Invalid existing engine file manifest")
+    private_pins = {}
+    record_pins = {}
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("sha256"), str):
+            raise AssetError("Invalid existing engine file digest")
+        path = _absolute(record.get("path", ""), "Existing engine file")
+        if str(path) in record_pins:
+            raise AssetError("Duplicate existing engine file record")
+        record_pins[str(path)] = record["sha256"]
+        try:
+            relative = path.relative_to(target).as_posix()
+        except ValueError:
+            continue
+        private_pins[relative] = record["sha256"]
+    if not private_pins:
+        raise AssetError("The existing private generation has no recorded files")
+    _verify_generation(target, private_pins)
+    # The launch contract selects only the already reviewed Proton launcher and
+    # client directory. It is not interpreted as a shell command.
+    worker = config.get("profiles", {}).get("headphones", {}).get("worker", config.get("worker"))
+    if not isinstance(worker, dict) or worker.get("cwd") != str(target):
+        raise AssetError("Existing original worker directory differs")
+    command, environment = worker.get("command"), worker.get("environment")
+    if (not isinstance(command, list) or len(command) < 2 or command[1] != "runinprefix"
+            or not isinstance(environment, dict)):
+        raise AssetError("Invalid existing original worker launch contract")
+    proton = _absolute(command[0], "Existing Proton")
+    if _hash(_regular_file(proton)) != record_pins.get(str(proton)):
+        raise AssetError("Existing Proton launcher digest differs")
+    compat = original / "compatdata" / generation
+    if (environment.get("STEAM_COMPAT_DATA_PATH") != str(compat)
+            or environment.get("WINEPREFIX") != str(compat / "pfx")
+            or environment.get("STEAM_COMPAT_INSTALL_PATH") != str(target)):
+        raise AssetError("Existing original private prefix differs")
+    steam = _directory(environment.get("STEAM_COMPAT_CLIENT_INSTALL_PATH", ""), "Existing Steam directory")
+    from .original_profiles import ensure_profile_xml_sources
+    try:
+        speaker_xml, headphone_xml = ensure_profile_xml_sources(
+            speaker_xml=speaker_xml, headphone_xml=headphone_xml,
+            runtime_dir=runtime_dir, allow_download=allow_download)
+    except (ValueError, OSError) as error:
+        raise AssetError("Cannot prepare the official profile XML sources: " + str(error)) from error
+    return import_engine(target / "original", target / "python-embed", proton,
+                         steam_dir=steam, runtime_dir=runtime_dir, public_dir=public_dir,
+                         speaker_xml=speaker_xml, headphone_xml=headphone_xml)
